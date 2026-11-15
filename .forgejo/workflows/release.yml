@@ -1,0 +1,199 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set up Java 25
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Validate release tag
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', os.environ['GITHUB_REF_NAME']):
+              sys.exit('Expected vMAJOR.MINOR.PATCH without leading zeros')
+          PY
+      - name: Build one release JAR
+        run: ./gradlew --no-daemon clean build -PreleaseVersion="${GITHUB_REF_NAME#v}"
+      - name: Create checksum sidecar
+        run: |
+          jar="build/libs/pierdol-auth-paper-${GITHUB_REF_NAME#v}.jar"
+          test -f "$jar"
+          sha256sum "$jar" > "$jar.sha256"
+      - name: Publish immutable assets
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          FORGEJO_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+          from urllib.parse import quote, urlsplit
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          token = os.environ['FORGEJO_TOKEN']
+          server = os.environ['FORGEJO_URL'].rstrip('/')
+          repository = os.environ['REPOSITORY']
+          tag = os.environ['TAG']
+          trigger_sha = os.environ.get('GITHUB_SHA', '')
+          require(token and server and repository and tag, 'Missing release environment')
+          require(re.fullmatch(r'[0-9a-fA-F]{40}', trigger_sha) is not None,
+                  'Invalid triggering commit SHA')
+          origin = urlsplit(server)
+          require(origin.scheme in ('http', 'https') and origin.netloc and not origin.username,
+                  'Invalid server URL')
+          repository_api = server + '/api/v1/repos/' + quote(repository, safe='/')
+          base = repository_api + '/releases'
+          jar = Path('build/libs') / ('pierdol-auth-paper-' + tag[1:] + '.jar')
+          expected = {path.name: path for path in (jar, Path(str(jar) + '.sha256'))}
+          require(all(path.is_file() for path in expected.values()), 'Missing release files')
+
+          def api(method, url, payload=None, attachment=None, missing_ok=False):
+              with tempfile.TemporaryDirectory() as directory:
+                  body = Path(directory) / 'response.json'
+                  command = ['curl', '--silent', '--show-error', '--request', method,
+                             '--header', '@-',
+                             '--output', str(body), '--write-out', '%{http_code}']
+                  if payload is not None:
+                      command += ['--header', 'Content-Type: application/json', '--data', payload]
+                  if attachment is not None:
+                      command += ['--form', 'attachment=@' + str(attachment)]
+                  try:
+                      status = subprocess.check_output(
+                          command + [url], input=f'Authorization: token {token}\n',
+                          text=True, stderr=subprocess.PIPE).strip()
+                  except (subprocess.CalledProcessError, OSError):
+                      raise SystemExit('Release API transport failed') from None
+                  if missing_ok and status == '404':
+                      return None
+                  require(status in ('200', '201'), 'Release API request failed (HTTP ' + status + ')')
+                  return json.loads(body.read_text())
+
+          def validate_release(release, draft):
+              require(isinstance(release, dict), 'Invalid release response')
+              require(release.get('tag_name') == tag, 'Release tag mismatch')
+              require(type(release.get('id')) is int and release['id'] > 0, 'Invalid release ID')
+              require(release.get('draft') is draft, 'Unexpected release publication state')
+              return release['id']
+
+          ref = api('GET', repository_api + '/git/refs/tags/' + quote(tag, safe=''))
+          require(isinstance(ref, dict) and ref.get('ref') == 'refs/tags/' + tag,
+                  'Invalid release tag ref')
+          obj = ref.get('object')
+          max_tag_depth = 5
+          depth = 0
+          while True:
+              require(isinstance(obj, dict), 'Invalid tag target object')
+              object_type = obj.get('type')
+              object_sha = obj.get('sha')
+              require(isinstance(object_sha, str)
+                      and re.fullmatch(r'[0-9a-fA-F]{40}', object_sha) is not None,
+                      'Invalid tag target SHA')
+              if object_type == 'commit':
+                  require(object_sha == trigger_sha, 'Tag does not match triggering commit')
+                  break
+              require(object_type == 'tag', 'Unsupported tag target type')
+              require(depth < max_tag_depth, 'Tag dereference depth exceeded')
+              annotated = api('GET', repository_api + '/git/tags/' + object_sha)
+              require(isinstance(annotated, dict) and annotated.get('sha') == object_sha,
+                      'Invalid annotated tag response')
+              obj = annotated.get('object')
+              depth += 1
+
+          release = api('GET', base + '/tags/' + quote(tag, safe=''), missing_ok=True)
+          if release is None:
+              payload = json.dumps({'tag_name': tag, 'name': tag, 'draft': True,
+                                    'target_commitish': trigger_sha})
+              release = api('POST', base, payload=payload)
+          release_id = validate_release(release, True)
+          release_url = base + '/' + str(release_id)
+
+          def assets():
+              found = {}
+              seen_ids = set()
+              page = 1
+              while True:
+                  batch = api('GET', release_url + '/assets?limit=50&page=' + str(page))
+                  require(isinstance(batch, list), 'Invalid asset listing')
+                  if not batch:
+                      return found
+                  for asset in batch:
+                      require(isinstance(asset, dict), 'Invalid asset response')
+                      name = asset.get('name')
+                      require(isinstance(name, str) and name in expected, 'Unexpected asset name')
+                      require(name not in found, 'Ambiguous asset name')
+                      asset_id = asset.get('id')
+                      require(type(asset_id) is int and asset_id > 0 and asset_id not in seen_ids,
+                              'Invalid or repeated asset ID')
+                      seen_ids.add(asset_id)
+                      found[name] = asset
+                  page += 1
+
+          def checksum(path):
+              return subprocess.check_output(['sha256sum', str(path)], text=True).split()[0]
+
+          def verify(asset, local):
+              require(isinstance(asset, dict) and asset.get('name') == local.name,
+                      'Uploaded asset name mismatch')
+              url = asset.get('browser_download_url')
+              require(isinstance(url, str) and url, 'Missing asset download URL')
+              target = urlsplit(url)
+              require((target.scheme, target.netloc) == (origin.scheme, origin.netloc)
+                      and not target.username, 'Untrusted asset download URL')
+              with tempfile.TemporaryDirectory() as directory:
+                  downloaded = Path(directory) / 'asset'
+                  try:
+                      subprocess.run(['curl', '--silent', '--show-error', '--fail', '--location',
+                                      '--proto', '=http,https', '--proto-redir', '=http,https',
+                                      '--header', '@-', '--output', str(downloaded), url],
+                                     input=f'Authorization: token {token}\n', text=True,
+                                     stderr=subprocess.PIPE, check=True)
+                  except (subprocess.CalledProcessError, OSError):
+                      raise SystemExit('Asset download transport failed') from None
+                  require(checksum(downloaded) == checksum(local), 'Asset checksum mismatch')
+
+          existing = assets()
+          for name, asset in existing.items():
+              verify(asset, expected[name])
+          for name, local in expected.items():
+              if name not in existing:
+                  uploaded = api('POST', release_url + '/assets', attachment=local)
+                  verify(uploaded, local)
+
+          # recheck the draft
+          current = api('GET', release_url)
+          require(validate_release(current, True) == release_id, 'Release ID changed')
+          complete = assets()
+          require(set(complete) == set(expected), 'Incomplete release assets')
+          for name, local in expected.items():
+              verify(complete[name], local)
+          published = api('PATCH', release_url, payload='{"draft":false}')
+          require(validate_release(published, False) == release_id, 'Release ID changed')
+          PY
