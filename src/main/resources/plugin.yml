@@ -1,0 +1,9 @@
+name: PierdolAuth
+main: dev.sccl.pierdolauth.PierdolAuthPlugin
+version: ${version}
+api-version: '26.3'
+softdepend: [FastLogin]
+commands:
+  login:
+    usage: /login <password>
+    permission: pierdolauth.login
