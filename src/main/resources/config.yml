@@ -1,0 +1,6 @@
+server-id: sb
+api-base-url: http://mine-platform:8088/internal/game-auth/v1
+credential-file: /run/secrets/pierdolauth-api-token
+whitelist-sync-seconds: 60
+session-lease-seconds: 120
+login-command: login
