@@ -2,6 +2,10 @@
 # Manual edits can break the build and are not advised.
 # This file is expected to be part of source control.
 biz.aQute.bnd:biz.aQute.bnd.annotation:7.1.0=compileClasspath
+com.fasterxml.jackson.core:jackson-annotations:2.19.2=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
+com.fasterxml.jackson.core:jackson-core:2.19.2=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
+com.fasterxml.jackson.core:jackson-databind:2.19.2=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
+com.fasterxml.jackson:jackson-bom:2.19.2=compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath
 com.google.auto.service:auto-service-annotations:1.1.1=compileClasspath
 com.google.code.gson:gson:2.14.0=compileClasspath,testRuntimeClasspath
 com.google.errorprone:error_prone_annotations:2.48.0=compileClasspath,testRuntimeClasspath
@@ -67,4 +71,4 @@ org.osgi:org.osgi.service.serviceloader:1.0.0=compileClasspath
 org.slf4j:jcl-over-slf4j:1.7.36=testRuntimeClasspath
 org.slf4j:slf4j-api:2.0.17=compileClasspath,testRuntimeClasspath
 org.yaml:snakeyaml:2.2=compileClasspath,testCompileClasspath,testRuntimeClasspath
-empty=annotationProcessor,runtimeClasspath,testAnnotationProcessor
+empty=annotationProcessor,testAnnotationProcessor

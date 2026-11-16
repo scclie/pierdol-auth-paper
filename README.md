@@ -1,3 +1,4 @@
 # # pierdolauth
 
-a paperMC 26.3 auth plugin for cracked/licensed players that sync with the [mine.pierdol.ing](https://git.sccl.cc/scclie/mine.pierdol.ing) api
+paper 26.3 plugin with an async game-auth read client and [mine.pierdol.ing](https://git.sccl.cc/scclie/mine.pierdol.ing) api managed
+standard paperMC whitelist sync.

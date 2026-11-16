@@ -1,6 +1,7 @@
 package dev.sccl.pierdolauth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.InputStream;
@@ -13,8 +14,11 @@ import org.yaml.snakeyaml.Yaml;
 final class PluginMetadataTest {
     @Test
     void packagedPluginMetadataIsCompleteAndSecretFree() throws Exception {
-        Path jarPath = Path.of("build", "libs", "pierdol-auth-paper-0.1.0-SNAPSHOT.jar");
+        String expectedVersion = System.getProperty("pierdolAuthVersion");
+        assertNotNull(expectedVersion, "Gradle must independently supply the expected project version");
+        Path jarPath = Path.of(System.getProperty("pierdolAuthJar"));
         assertTrue(Files.isRegularFile(jarPath));
+        assertEquals("pierdol-auth-paper-" + expectedVersion + ".jar", jarPath.getFileName().toString());
 
         try (JarFile jar = new JarFile(jarPath.toFile());
              InputStream stream = jar.getInputStream(jar.getJarEntry("plugin.yml"))) {
@@ -23,7 +27,8 @@ final class PluginMetadataTest {
             assertEquals("PierdolAuth", pluginYaml.get("name"));
             assertEquals("dev.sccl.pierdolauth.PierdolAuthPlugin", pluginYaml.get("main"));
             assertEquals("26.3", pluginYaml.get("api-version"));
-            assertEquals("0.1.0-SNAPSHOT", pluginYaml.get("version"));
+            assertEquals(expectedVersion, pluginYaml.get("version"));
+            assertEquals(expectedVersion, jar.getManifest().getMainAttributes().getValue("Implementation-Version"));
             assertTrue(((java.util.List<?>) pluginYaml.get("softdepend")).contains("FastLogin"));
             assertTrue(((java.util.Map<?, ?>) pluginYaml.get("commands")).containsKey("login"));
         }
