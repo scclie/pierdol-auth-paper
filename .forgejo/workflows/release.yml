@@ -39,8 +39,8 @@ jobs:
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
           FORGEJO_URL: ${{ github.server_url }}
+          FORGEJO_PUBLIC_URL: https://git.sccl.cc
           REPOSITORY: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -58,8 +58,9 @@ jobs:
 
           token = os.environ['FORGEJO_TOKEN']
           server = os.environ['FORGEJO_URL'].rstrip('/')
+          public = os.environ['FORGEJO_PUBLIC_URL'].rstrip('/')
           repository = os.environ['REPOSITORY']
-          tag = os.environ['TAG']
+          tag = os.environ['GITHUB_REF_NAME']
           trigger_sha = os.environ.get('GITHUB_SHA', '')
           require(token and server and repository and tag, 'Missing release environment')
           require(re.fullmatch(r'[0-9a-fA-F]{40}', trigger_sha) is not None,
@@ -67,6 +68,11 @@ jobs:
           origin = urlsplit(server)
           require(origin.scheme in ('http', 'https') and origin.netloc and not origin.username,
                   'Invalid server URL')
+          public_origin = urlsplit(public)
+          require(public_origin.scheme in ('http', 'https') and public_origin.netloc
+                  and not public_origin.username, 'Invalid public URL')
+          trusted_asset_origins = {(origin.scheme, origin.netloc),
+                                   (public_origin.scheme, public_origin.netloc)}
           repository_api = server + '/api/v1/repos/' + quote(repository, safe='/')
           base = repository_api + '/releases'
           jar = Path('build/libs') / ('pierdol-auth-paper-' + tag[1:] + '.jar')
@@ -102,6 +108,8 @@ jobs:
               return release['id']
 
           ref = api('GET', repository_api + '/git/refs/tags/' + quote(tag, safe=''))
+          require(isinstance(ref, list) and len(ref) == 1, 'Invalid release tag ref')
+          ref = ref[0]
           require(isinstance(ref, dict) and ref.get('ref') == 'refs/tags/' + tag,
                   'Invalid release tag ref')
           obj = ref.get('object')
@@ -163,7 +171,7 @@ jobs:
               url = asset.get('browser_download_url')
               require(isinstance(url, str) and url, 'Missing asset download URL')
               target = urlsplit(url)
-              require((target.scheme, target.netloc) == (origin.scheme, origin.netloc)
+              require((target.scheme, target.netloc) in trusted_asset_origins
                       and not target.username, 'Untrusted asset download URL')
               with tempfile.TemporaryDirectory() as directory:
                   downloaded = Path(directory) / 'asset'
