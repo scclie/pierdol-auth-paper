@@ -39,7 +39,6 @@ jobs:
         env:
           FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
           FORGEJO_URL: ${{ github.server_url }}
-          FORGEJO_PUBLIC_URL: https://git.sccl.cc
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -58,7 +57,6 @@ jobs:
 
           token = os.environ['FORGEJO_TOKEN']
           server = os.environ['FORGEJO_URL'].rstrip('/')
-          public = os.environ['FORGEJO_PUBLIC_URL'].rstrip('/')
           repository = os.environ['REPOSITORY']
           tag = os.environ['GITHUB_REF_NAME']
           trigger_sha = os.environ.get('GITHUB_SHA', '')
@@ -68,11 +66,6 @@ jobs:
           origin = urlsplit(server)
           require(origin.scheme in ('http', 'https') and origin.netloc and not origin.username,
                   'Invalid server URL')
-          public_origin = urlsplit(public)
-          require(public_origin.scheme in ('http', 'https') and public_origin.netloc
-                  and not public_origin.username, 'Invalid public URL')
-          trusted_asset_origins = {(origin.scheme, origin.netloc),
-                                   (public_origin.scheme, public_origin.netloc)}
           repository_api = server + '/api/v1/repos/' + quote(repository, safe='/')
           base = repository_api + '/releases'
           jar = Path('build/libs') / ('pierdol-auth-paper-' + tag[1:] + '.jar')
@@ -168,10 +161,11 @@ jobs:
           def verify(asset, local):
               require(isinstance(asset, dict) and asset.get('name') == local.name,
                       'Uploaded asset name mismatch')
-              url = asset.get('browser_download_url')
-              require(isinstance(url, str) and url, 'Missing asset download URL')
+              asset_id = asset.get('id')
+              require(type(asset_id) is int and asset_id > 0, 'Invalid asset ID')
+              url = release_url + '/assets/' + str(asset_id)
               target = urlsplit(url)
-              require((target.scheme, target.netloc) in trusted_asset_origins
+              require((target.scheme, target.netloc) == (origin.scheme, origin.netloc)
                       and not target.username, 'Untrusted asset download URL')
               with tempfile.TemporaryDirectory() as directory:
                   downloaded = Path(directory) / 'asset'
