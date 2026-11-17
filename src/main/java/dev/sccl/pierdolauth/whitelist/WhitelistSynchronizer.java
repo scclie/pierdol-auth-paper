@@ -16,6 +16,7 @@ public final class WhitelistSynchronizer implements AutoCloseable {
     private final GameAuthClient client;
     private final PaperWhitelist whitelist;
     private final Consumer<Runnable> mainThread;
+    private final Consumer<WhitelistResult.Snapshot> publisher;
     private final long intervalNanos;
     private final ScheduledExecutorService timer;
     private final AtomicBoolean inFlight = new AtomicBoolean();
@@ -27,9 +28,16 @@ public final class WhitelistSynchronizer implements AutoCloseable {
 
     public WhitelistSynchronizer(GameAuthClient client, PaperWhitelist whitelist,
             Duration interval, Consumer<Runnable> mainThread) {
+        this(client, whitelist, interval, mainThread, snapshot -> {});
+    }
+
+    public WhitelistSynchronizer(GameAuthClient client, PaperWhitelist whitelist,
+            Duration interval, Consumer<Runnable> mainThread,
+            Consumer<WhitelistResult.Snapshot> publisher) {
         this.client = Objects.requireNonNull(client);
         this.whitelist = Objects.requireNonNull(whitelist);
         this.mainThread = Objects.requireNonNull(mainThread);
+        this.publisher = Objects.requireNonNull(publisher);
         intervalNanos = interval.toNanos();
         if (intervalNanos <= 0) throw new IllegalArgumentException("Interval must be positive");
         timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -77,6 +85,7 @@ public final class WhitelistSynchronizer implements AutoCloseable {
         if (closed) return;
         try {
             whitelist.replaceWith(snapshot.identities());
+            publisher.accept(snapshot);
             cursor = OptionalLong.of(snapshot.version());
         } catch (RuntimeException ignored) {
             // Retry from the last successfully applied version; never log API data.

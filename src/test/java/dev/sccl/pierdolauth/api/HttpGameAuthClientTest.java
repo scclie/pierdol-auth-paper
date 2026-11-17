@@ -34,6 +34,433 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class HttpGameAuthClientTest {
+    private static final UUID AUTH_UUID = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
+    private final String syntheticLease = java.util.stream.IntStream.range(0, 64)
+            .mapToObj(index -> Integer.toHexString(index % 16)).collect(java.util.stream.Collectors.joining());
+    private char[] expectedPassword;
+    private volatile boolean exactPostBody;
+
+    @Test
+    void crackedLoginSendsExactPostAndRetainsOnlySessionIdentity() throws Exception {
+        body = authEnvelope("allow", 1700000000, 7);
+        expectedPassword = (UUID.randomUUID().toString() + (char) 34 + (char) 92 + (char) 10 + (char) 233).toCharArray();
+        char[] owned = expectedPassword.clone();
+        var stage = client.crackedLogin("Player", owned);
+        assertTrue(allCleared(owned), "Owned input must be cleared synchronously");
+        var result = assertInstanceOf(CrackedLoginResult.Allowed.class, await(stage));
+        assertEquals(AUTH_UUID, result.uuid());
+        assertTrue(syntheticLease.equals(result.lease()), "Session identity must be retained");
+        assertEquals(1700000000, result.expiresAtEpochSeconds());
+        assertEquals(3, result.getClass().getRecordComponents().length);
+        assertPost("cracked-login");
+    }
+
+    @Test
+    void sessionCheckSendsExactPostAndRetainsOnlySessionIdentity() throws Exception {
+        body = authEnvelope("continue", 1700000001, 8);
+        var result = assertInstanceOf(SessionCheckResult.Continued.class, await(client.checkSession(syntheticLease)));
+        assertEquals(AUTH_UUID, result.uuid());
+        assertTrue(syntheticLease.equals(result.lease()), "Session identity must be retained");
+        assertEquals(1700000001, result.expiresAtEpochSeconds());
+        assertEquals(3, result.getClass().getRecordComponents().length);
+        assertPost("session-check");
+    }
+
+    private String authEnvelope(String outcome, long expiry, long version) {
+        return "{\"outcome\":\"" + outcome + "\",\"uuid\":\"" + AUTH_UUID
+                + "\",\"lease\":\"" + syntheticLease + "\",\"expires_at\":" + expiry
+                + ",\"whitelist_version\":" + version + "}";
+    }
+
+    private static boolean allCleared(char[] value) {
+        for (char character : value) if (character != 0) return false;
+        return true;
+    }
+
+    @ParameterizedTest(name = "explicit negative envelope {index}")
+    @ValueSource(booleans = {false, true})
+    void mapsOnlyExactNegativeEnvelope(boolean session) throws Exception {
+        body = "{\"outcome\":\"" + (session ? "disconnect" : "deny") + "\",\"whitelist_version\":7}";
+        Object result = await(authCall(session));
+        assertTrue(session ? result instanceof SessionCheckResult.Disconnected
+                : result instanceof CrackedLoginResult.Denied, "Expected explicit negative result");
+    }
+
+    @ParameterizedTest(name = "invalid authentication envelopes {index}")
+    @ValueSource(booleans = {false, true})
+    void rejectsEveryMalformedAuthenticationEnvelope(boolean session) throws Exception {
+        String valid = authEnvelope(session ? "continue" : "allow", 1700000000, 7);
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        List<String> invalid = new ArrayList<>(List.of("", "{", "null", "[]", "42", "\"text\"", "{}",
+                valid + " {}", valid.replaceFirst("\\{", "{\"outcome\":\"deny\","),
+                valid.substring(0, valid.length() - 1) + ",\"extra\":true}",
+                "{\"outcome\":\"" + (session ? "deny" : "disconnect") + "\",\"whitelist_version\":7}"));
+        for (String field : List.of("outcome", "uuid", "lease", "expires_at", "whitelist_version")) {
+            var node = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(valid);
+            node.remove(field);
+            invalid.add(node.toString());
+            for (String replacement : List.of("null", "true", "[]", "{}", "42.5")) {
+                node = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(valid);
+                node.set(field, mapper.readTree(replacement));
+                invalid.add(node.toString());
+            }
+        }
+        for (String field : List.of("expires_at", "whitelist_version")) {
+            for (String replacement : List.of("-1", "1.0", "9223372036854775808", "\"7\"")) {
+                var node = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(valid);
+                node.set(field, mapper.readTree(replacement));
+                invalid.add(node.toString());
+            }
+        }
+        for (String uuid : List.of("invalid", "1-1-1-1-1", AUTH_UUID + " ")) {
+            var node = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(valid);
+            node.put("uuid", uuid);
+            invalid.add(node.toString());
+        }
+        for (String lease : List.of("", " ", "a".repeat(63), "a".repeat(65), "g".repeat(64))) {
+            var node = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(valid);
+            node.put("lease", lease);
+            invalid.add(node.toString());
+        }
+        for (String outcome : List.of("unknown", session ? "allow" : "continue", session ? "deny" : "disconnect")) {
+            var node = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(valid);
+            node.put("outcome", outcome);
+            invalid.add(node.toString());
+        }
+        String negative = "{\"outcome\":\"" + (session ? "disconnect" : "deny") + "\",\"whitelist_version\":7}";
+        invalid.add(negative.replace("7", "-1"));
+        invalid.add(negative.replace("7", "7.0"));
+        invalid.add(negative.replace("7", "null"));
+        invalid.add(negative.replace("}", ",\"extra\":true}"));
+        for (String response : invalid) {
+            body = response;
+            assertAuthUnavailable(await(authCall(session)), session);
+        }
+    }
+
+    @ParameterizedTest(name = "authentication numeric boundaries {index}")
+    @ValueSource(booleans = {false, true})
+    void acceptsUppercaseHexAndNonnegativeLongBoundaries(boolean session) throws Exception {
+        for (long number : new long[] {0, Long.MAX_VALUE}) {
+            body = authEnvelope(session ? "continue" : "allow", number, number)
+                    .replace(syntheticLease, syntheticLease.toUpperCase(java.util.Locale.ROOT));
+            Object result = await(authCall(session));
+            assertTrue(session ? result instanceof SessionCheckResult.Continued
+                    : result instanceof CrackedLoginResult.Allowed, "Expected valid boundary result");
+        }
+    }
+
+    @ParameterizedTest(name = "authentication status rejection {index}")
+    @ValueSource(booleans = {false, true})
+    void rejectsNon200PostsWithoutFollowingRedirects(boolean session) throws Exception {
+        body = authEnvelope(session ? "continue" : "allow", 1700000000, 7);
+        for (int code : new int[] {201, 204, 301, 302, 307, 400, 401, 403, 404, 429, 500, 503}) {
+            requests.clear();
+            status = code;
+            assertAuthUnavailable(await(authCall(session)), session);
+            assertEquals(1, requests.size());
+        }
+    }
+
+    @ParameterizedTest(name = "bounded authentication body {index}")
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void boundsPostsAndRecoversForLaterGetAndPost(boolean session, boolean useChunks) throws Exception {
+        chunked = useChunks;
+        String valid = authEnvelope(session ? "continue" : "allow", 1700000000, 7);
+        body = padded(valid, 1_048_576);
+        Object boundary = await(authCall(session));
+        assertTrue(session ? boundary instanceof SessionCheckResult.Continued
+                : boundary instanceof CrackedLoginResult.Allowed, "Body at cap must be accepted");
+        body = padded(valid, 1_048_577);
+        assertAuthUnavailable(await(authCall(session)), session);
+        body = "{\"outcome\":\"licensed\"}";
+        assertEquals(PolicyResult.LICENSED, await(client.fetchPolicy("Player")));
+        body = valid;
+        Object recovered = await(authCall(session));
+        assertTrue(session ? recovered instanceof SessionCheckResult.Continued
+                : recovered instanceof CrackedLoginResult.Allowed, "POST must recover after overflow");
+        status = 503;
+        assertAuthUnavailable(await(authCall(session)), session);
+        status = 200;
+        assertTrue(session ? await(authCall(true)) instanceof SessionCheckResult.Continued
+                : await(authCall(false)) instanceof CrackedLoginResult.Allowed, "POST must recover after failure");
+    }
+
+    @Test
+    void invalidInputsNeverSendAndAlwaysClearOwnedPassword() throws Exception {
+        for (String nickname : new String[] {null, "", "  ", "Player\nOne", "\u0000", "\ud800"}) {
+            char[] owned = UUID.randomUUID().toString().toCharArray();
+            assertAuthUnavailable(await(client.crackedLogin(nickname, owned)), false);
+            assertTrue(allCleared(owned), "Invalid input must still be cleared");
+        }
+        assertAuthUnavailable(await(client.crackedLogin("Player", null)), false);
+        for (String lease : new String[] {null, "", " ", "a".repeat(63), "a".repeat(65), "g".repeat(64)}) {
+            assertAuthUnavailable(await(client.checkSession(lease)), true);
+        }
+        assertTrue(requests.isEmpty());
+    }
+
+    @ParameterizedTest(name = "authentication timeout {index}")
+    @ValueSource(booleans = {false, true})
+    void postTimeoutIsUnavailableWithoutBlockingCaller(boolean session) throws Exception {
+        responseGate = new CountDownLatch(1);
+        requestReceived = new CountDownLatch(1);
+        var stage = assertTimeoutPreemptively(java.time.Duration.ofSeconds(1), () -> authCall(session));
+        assertTrue(requestReceived.await(2, TimeUnit.SECONDS));
+        assertFalse(stage.toCompletableFuture().isDone());
+        assertAuthUnavailable(await(stage), session);
+    }
+
+    @Test
+    void closeAndTransportFailureReturnUnavailableWithoutDiagnosticDisclosure() throws Exception {
+        var messages = new StringBuilder();
+        var logger = java.util.logging.Logger.getLogger("");
+        var handler = new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) {
+                messages.append(record.getMessage());
+                if (record.getThrown() != null) messages.append(record.getThrown().getMessage());
+            }
+            @Override public void flush() {}
+            @Override public void close() {}
+        };
+        logger.addHandler(handler);
+        expectedPassword = UUID.randomUUID().toString().toCharArray();
+        try {
+            body = new String(expectedPassword);
+            assertAuthUnavailable(await(client.crackedLogin("Player", expectedPassword.clone())), false);
+            server.stop(0);
+            assertAuthUnavailable(await(authCall(false)), false);
+            assertAuthUnavailable(await(authCall(true)), true);
+            client.close();
+            char[] owned = expectedPassword.clone();
+            assertAuthUnavailable(await(client.crackedLogin("Player", owned)), false);
+            assertTrue(allCleared(owned), "Closed client must clear owned input");
+            assertAuthUnavailable(await(authCall(true)), true);
+            assertFalse(messages.toString().contains(new String(expectedPassword)), "Diagnostics must be value-free");
+            assertFalse(messages.toString().contains(syntheticLease), "Diagnostics must be value-free");
+            String authorization = Files.readString(temporary.resolve("credential")).strip();
+            assertFalse(messages.toString().contains(authorization), "Diagnostics must be value-free");
+        } finally {
+            logger.removeHandler(handler);
+        }
+    }
+
+    private CompletionStage<?> authCall(boolean session) {
+        return session ? client.checkSession(syntheticLease)
+                : client.crackedLogin("Player", UUID.randomUUID().toString().toCharArray());
+    }
+
+    private static void assertAuthUnavailable(Object result, boolean session) {
+        assertTrue(session ? result instanceof SessionCheckResult.Unavailable
+                : result instanceof CrackedLoginResult.Unavailable, "Expected unavailable result");
+    }
+
+    @Test
+    void authenticationResultDiagnosticsDoNotDiscloseSessionMaterial() {
+        var allowed = new CrackedLoginResult.Allowed(AUTH_UUID, syntheticLease, 1700000000);
+        var continued = new SessionCheckResult.Continued(AUTH_UUID, syntheticLease, 1700000001);
+        assertFalse(allowed.toString().contains(syntheticLease), "Result diagnostics must be value-free");
+        assertFalse(continued.toString().contains(syntheticLease), "Result diagnostics must be value-free");
+    }
+
+    @ParameterizedTest(name = "oversized unfinished authentication stream {index}")
+    @CsvSource({"false,200", "true,200", "false,503", "true,503"})
+    void rejectsOversizedPostBeforeStreamEnds(boolean session, int responseStatus) throws Exception {
+        status = responseStatus;
+        chunked = true;
+        body = padded(authEnvelope(session ? "continue" : "allow", 1700000000, 7), 1_048_577);
+        bodySent = new CountDownLatch(1);
+        bodyEndGate = new CountDownLatch(1);
+        var stage = authCall(session);
+        assertTrue(bodySent.await(2, TimeUnit.SECONDS));
+        Object result = assertTimeoutPreemptively(java.time.Duration.ofMillis(1500), () -> await(stage));
+        assertAuthUnavailable(result, session);
+        assertEquals(1, bodyEndGate.getCount(), "Must reject before end of stream");
+    }
+
+    @Test
+    void closingClientCompletesInflightAndQueuedPostsAndClearsPasswords() throws Exception {
+        responseGate = new CountDownLatch(1);
+        requestReceived = new CountDownLatch(1);
+        var inflight = authCall(true);
+        assertTrue(requestReceived.await(2, TimeUnit.SECONDS));
+        List<CompletionStage<?>> queued = new ArrayList<>();
+        for (int index = 0; index < 10; index++) {
+            char[] owned = UUID.randomUUID().toString().toCharArray();
+            queued.add(client.crackedLogin("Player", owned));
+            assertTrue(allCleared(owned), "Queued input must be cleared synchronously");
+        }
+        client.close();
+        assertAuthUnavailable(await(inflight), true);
+        for (var stage : queued) assertAuthUnavailable(await(stage), false);
+    }
+
+    @Test
+    void saturatedExecutorRejectsPostsWithoutBlockingOrRetainingOwnedPassword() throws Exception {
+        responseGate = new CountDownLatch(1);
+        requestReceived = new CountDownLatch(1);
+        authCall(true);
+        assertTrue(requestReceived.await(2, TimeUnit.SECONDS));
+        List<CompletionStage<?>> results = assertTimeoutPreemptively(java.time.Duration.ofSeconds(1), () -> {
+            List<CompletionStage<?>> submitted = new ArrayList<>();
+            for (int index = 0; index < 100; index++) {
+                char[] owned = UUID.randomUUID().toString().toCharArray();
+                submitted.add(client.crackedLogin("Player", owned));
+                assertTrue(allCleared(owned), "Saturated input must be cleared synchronously");
+            }
+            return submitted;
+        });
+        assertTrue(results.stream().anyMatch(stage -> stage.toCompletableFuture().isDone()),
+                "Bounded queue must reject excess POST work");
+        for (var stage : results) {
+            if (stage.toCompletableFuture().isDone()) assertAuthUnavailable(await(stage), false);
+        }
+    }
+
+    @Test
+    void retainedRequestBytesAreClearedBeforeCompletionConsumersRun() throws Exception {
+        responseGate = new CountDownLatch(1);
+        requestReceived = new CountDownLatch(1);
+        client.fetchPolicy("Player");
+        assertTrue(requestReceived.await(2, TimeUnit.SECONDS));
+        client.fetchPolicy("Player");
+        var stage = authCall(false);
+        var executorField = HttpGameAuthClient.class.getDeclaredField("executor");
+        executorField.setAccessible(true);
+        var executor = (java.util.concurrent.ThreadPoolExecutor) executorField.get(client);
+        Runnable queued = executor.getQueue().peek();
+        assertNotNull(queued, "POST must be queued behind blocked transport work");
+        java.net.http.HttpRequest captured = null;
+        for (var field : queued.getClass().getDeclaredFields()) {
+            if (field.getType() == java.net.http.HttpRequest.class) {
+                field.setAccessible(true);
+                captured = (java.net.http.HttpRequest) field.get(queued);
+            }
+        }
+        assertNotNull(captured, "Queued work must own its synchronously built request");
+        var publisher = captured.bodyPublisher().orElseThrow();
+        var observed = stage.thenApply(ignored -> publisherContainsOnlyClearedBytes(publisher));
+        responseGate.countDown();
+        assertTrue(await(observed), "Retained mutable bytes must be cleared before completion consumers");
+    }
+
+    @ParameterizedTest(name = "external terminal operation preserves queued POST {index}")
+    @ValueSource(strings = {"cancel", "complete", "exception", "obtrude", "obtrudeException"})
+    void externalTerminalOperationsCannotAlterQueuedPostOrExposeUnclearedBytes(String operation) throws Exception {
+        externalTerminalOperationPreservesTransport(operation, false);
+    }
+
+    @ParameterizedTest(name = "external terminal operation preserves in-flight POST {index}")
+    @ValueSource(strings = {"cancel", "complete", "exception", "obtrude", "obtrudeException"})
+    void externalTerminalOperationsCannotFinishInflightPostBeforeCleanup(String operation) throws Exception {
+        externalTerminalOperationPreservesTransport(operation, true);
+    }
+
+    private void externalTerminalOperationPreservesTransport(String operation, boolean inflight) throws Exception {
+        var executorField = HttpGameAuthClient.class.getDeclaredField("executor");
+        executorField.setAccessible(true);
+        var executor = (java.util.concurrent.ThreadPoolExecutor) executorField.get(client);
+        var workersBlocked = new CountDownLatch(2);
+        var workerGate = new CountDownLatch(1);
+        Runnable block = () -> {
+            workersBlocked.countDown();
+            try {
+                workerGate.await();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        executor.execute(block);
+        executor.execute(block);
+        try {
+            assertTrue(workersBlocked.await(2, TimeUnit.SECONDS), "Both transport workers must be gated");
+            expectedPassword = UUID.randomUUID().toString().toCharArray();
+            body = "{\"outcome\":\"deny\",\"whitelist_version\":7}";
+            responseGate = new CountDownLatch(1);
+            requestReceived = new CountDownLatch(1);
+            var stage = client.crackedLogin("Player", expectedPassword.clone());
+            Runnable queued = executor.getQueue().peek();
+            assertNotNull(queued, "POST must remain queued until transport is released");
+            java.net.http.HttpRequest captured = null;
+            for (var field : queued.getClass().getDeclaredFields()) {
+                if (field.getType() == java.net.http.HttpRequest.class) {
+                    field.setAccessible(true);
+                    captured = (java.net.http.HttpRequest) field.get(queued);
+                }
+            }
+            assertNotNull(captured, "Queued work must own its synchronously built request");
+            var publisher = captured.bodyPublisher().orElseThrow();
+            var observed = stage.handle((value, failure) -> publisherContainsOnlyClearedBytes(publisher));
+            if (inflight) {
+                workerGate.countDown();
+                assertTrue(requestReceived.await(2, TimeUnit.SECONDS), "POST must be in flight");
+            }
+            // Exercise both a direct downcast (if exposed) and the public conversion.
+            if (stage instanceof CompletableFuture<CrackedLoginResult> direct) {
+                attemptExternalTerminalOperation(direct, operation);
+            }
+            attemptExternalTerminalOperation(stage.toCompletableFuture(), operation);
+            boolean observerRanEarly = observed.toCompletableFuture().isDone();
+            boolean bytesClearedEarly = publisherContainsOnlyClearedBytes(publisher);
+            workerGate.countDown();
+            responseGate.countDown();
+            // observe actual transport, not just the caller-controlled future's result
+            assertTrue(requestReceived.await(2, TimeUnit.SECONDS), "Queued POST must retain a valid wire body");
+            assertAll(
+                    () -> assertFalse(observerRanEarly, "External termination must not finish the public stage"),
+                    () -> assertFalse(bytesClearedEarly, "Active transport must retain its original request bytes"),
+                    () -> assertTrue(await(observed), "Observers must run only after internal cleanup"),
+                    () -> assertTrue(await(stage) instanceof CrackedLoginResult.Denied,
+                            "Only the internally parsed result may finish the public stage"),
+                    () -> assertTrue(exactPostBody, "External termination must not alter wire bytes"));
+            assertPost("cracked-login");
+        } finally {
+            workerGate.countDown();
+        }
+    }
+
+    private static void attemptExternalTerminalOperation(CompletableFuture<CrackedLoginResult> future,
+            String operation) {
+        try {
+            switch (operation) {
+                case "cancel" -> future.cancel(true);
+                case "complete" -> future.complete(new CrackedLoginResult.Unavailable());
+                case "exception" -> future.completeExceptionally(new IllegalStateException());
+                case "obtrude" -> future.obtrudeValue(new CrackedLoginResult.Unavailable());
+                case "obtrudeException" -> future.obtrudeException(new IllegalStateException());
+                default -> throw new AssertionError("Unknown terminal operation");
+            }
+        } catch (UnsupportedOperationException expected) {
+            // read-only stage
+        }
+    }
+
+    private static boolean publisherContainsOnlyClearedBytes(java.net.http.HttpRequest.BodyPublisher publisher) {
+        var observed = new CompletableFuture<Boolean>();
+        publisher.subscribe(new java.util.concurrent.Flow.Subscriber<java.nio.ByteBuffer>() {
+            private boolean cleared = true;
+            @Override public void onSubscribe(java.util.concurrent.Flow.Subscription subscription) {
+                subscription.request(Long.MAX_VALUE);
+            }
+            @Override public void onNext(java.nio.ByteBuffer buffer) {
+                while (buffer.hasRemaining()) if (buffer.get() != 0) cleared = false;
+            }
+            @Override public void onError(Throwable failure) { observed.complete(false); }
+            @Override public void onComplete() { observed.complete(cleared); }
+        });
+        return observed.join();
+    }
+
+    private void assertPost(String endpoint) throws Exception {
+        Request request = requests.poll(1, TimeUnit.SECONDS);
+        assertNotNull(request);
+        assertEquals("POST", request.method());
+        assertEquals("/internal/game-auth/v1/" + endpoint, request.target());
+        assertTrue(request.authorized(), "Expected synthetic authorization");
+        assertEquals("application/json", request.accept());
+        assertEquals("no-store", request.cacheControl());
+        assertTrue(exactPostBody, "Expected exact request fields and encoding");
+    }
     @TempDir Path temporary;
     private HttpServer server;
     private HttpGameAuthClient client;
@@ -184,6 +611,13 @@ class HttpGameAuthClientTest {
         var pending = new LinkedBlockingQueue<CompletableFuture<WhitelistResult>>();
         var cursors = new LinkedBlockingQueue<OptionalLong>();
         GameAuthClient controlled = new GameAuthClient() {
+            @Override public CompletionStage<CrackedLoginResult> crackedLogin(String nickname, char[] password) {
+                if (password != null) java.util.Arrays.fill(password, '\0');
+                return CompletableFuture.completedFuture(new CrackedLoginResult.Unavailable());
+            }
+            @Override public CompletionStage<SessionCheckResult> checkSession(String lease) {
+                return CompletableFuture.completedFuture(new SessionCheckResult.Unavailable());
+            }
             @Override public CompletionStage<PolicyResult> fetchPolicy(String nickname) { throw new AssertionError(); }
             @Override public CompletionStage<WhitelistResult> fetchWhitelist(OptionalLong cursor) {
                 cursors.add(cursor);
@@ -210,7 +644,7 @@ class HttpGameAuthClientTest {
             status = responseStatus;
             chunked = useChunks;
             body = padded("{\"outcome\":\"snapshot\",\"whitelist_version\":99,\"identities\":[]}", 1_048_577);
-            // Feed the real HTTP result into the real synchronizer, deterministically on this thread.
+            // feed the real HTTP result into the real synchronizer
             pending.remove().complete(await(client.fetchWhitelist(OptionalLong.of(12))));
             assertEquals(Set.of(existing), preserved.currentUuids());
             sync.syncNow();
@@ -478,6 +912,15 @@ class HttpGameAuthClientTest {
 
     private void respond(HttpExchange exchange) throws IOException {
         try (exchange) {
+            if (exchange.getRequestMethod().equals("POST")) {
+                var requestBody = new com.fasterxml.jackson.databind.ObjectMapper()
+                        .readTree(exchange.getRequestBody());
+                exactPostBody = exchange.getRequestURI().getPath().endsWith("/cracked-login")
+                        ? requestBody.size() == 2 && requestBody.path("nickname").asText().equals("Player")
+                                && expectedPassword != null
+                                && java.util.Arrays.equals(expectedPassword, requestBody.path("password").asText().toCharArray())
+                        : requestBody.size() == 1 && syntheticLease.equals(requestBody.path("lease").asText());
+            }
             requests.add(new Request(exchange.getRequestMethod(), exchange.getRequestURI().toASCIIString(),
                     "Bearer credential-sentinel".equals(exchange.getRequestHeaders().getFirst("Authorization")),
                     exchange.getRequestHeaders().getFirst("Accept"),

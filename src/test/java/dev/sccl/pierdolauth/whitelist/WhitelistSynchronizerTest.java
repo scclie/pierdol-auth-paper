@@ -8,6 +8,7 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
@@ -29,10 +30,111 @@ class WhitelistSynchronizerTest {
     private final FakeClient client = new FakeClient();
     private final RecordingWhitelist whitelist = new RecordingWhitelist();
     private final BlockingQueue<Runnable> mainThread = new LinkedBlockingQueue<>();
+    private final WhitelistRegistry registry = new WhitelistRegistry();
+    private int publications;
+    private boolean failPublication;
     private final WhitelistSynchronizer sync = new WhitelistSynchronizer(
-            client, whitelist, Duration.ofHours(1), mainThread::add);
+            client, whitelist, Duration.ofHours(1), mainThread::add, snapshot -> {
+                assertTrue(whitelist.onMainThread);
+                assertEquals(Thread.currentThread(), whitelist.mutationThread);
+                assertEquals(snapshot.identities(), whitelist.lastIdentities);
+                publications++;
+                if (failPublication) throw new IllegalStateException("synthetic publication failure");
+                registry.publish(snapshot.identities());
+            });
 
     @AfterEach void close() { sync.close(); }
+
+    @Test void replacementCompletesBeforeMetadataPublicationAndCursorAdvance() throws Exception {
+        whitelist.beforeReplacement = () -> {
+            assertFalse(registry.snapshot().ready());
+            assertEquals(0, publications);
+        };
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+        assertFalse(registry.snapshot().ready());
+        assertEquals(0, publications);
+        applyNext();
+        assertTrue(registry.snapshot().ready());
+        assertEquals(Map.of(CRACKED, ClientType.CRACKED, LICENSED, ClientType.LICENSED),
+                registry.snapshot().clientTypes());
+        assertEquals(1, publications);
+        sync.syncNow();
+        assertEquals(OptionalLong.of(42), client.next().cursor());
+    }
+
+    @Test void failedFirstReplacementDoesNotPublishOrAdvanceAndReleasesForOneRetry() throws Exception {
+        whitelist.failReplacement = true;
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+        applyNext();
+        assertFalse(registry.snapshot().ready());
+        assertEquals(0, publications);
+        sync.syncNow();
+        Request retry = client.next();
+        assertEquals(OptionalLong.empty(), retry.cursor());
+        sync.syncNow();
+        assertTrue(client.requests.isEmpty());
+        whitelist.failReplacement = false;
+        retry.result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+        applyNext();
+        assertTrue(registry.snapshot().ready());
+        assertEquals(1, publications);
+    }
+
+    @Test void publicationFailurePreservesPreviousRegistryAndCursorAndAllowsRetry() throws Exception {
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(12, IDENTITIES));
+        applyNext();
+        var previous = registry.snapshot();
+        failPublication = true;
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(99, List.of()));
+        applyNext();
+        assertSame(previous, registry.snapshot());
+        sync.syncNow();
+        Request retry = client.next();
+        assertEquals(OptionalLong.of(12), retry.cursor());
+        sync.syncNow();
+        assertTrue(client.requests.isEmpty());
+        failPublication = false;
+        retry.result().complete(new WhitelistResult.Snapshot(99, List.of()));
+        applyNext();
+        assertTrue(registry.snapshot().ready());
+        assertTrue(registry.snapshot().clientTypes().isEmpty());
+        sync.syncNow();
+        assertEquals(OptionalLong.of(99), client.next().cursor());
+    }
+
+    @Test void conflictingMetadataCannotPublishOrAdvanceCursor() throws Exception {
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(12, IDENTITIES));
+        applyNext();
+        var previous = registry.snapshot();
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(99, List.of(
+                new WhitelistIdentity("Player", ClientType.CRACKED, CRACKED),
+                new WhitelistIdentity("Player", ClientType.LICENSED, CRACKED))));
+        applyNext();
+        assertSame(previous, registry.snapshot());
+        sync.syncNow();
+        assertEquals(OptionalLong.of(12), client.next().cursor());
+    }
+
+    @Test void failedLaterReplacementPreservesPublishedSnapshot() throws Exception {
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(12, IDENTITIES));
+        applyNext();
+        var previous = registry.snapshot();
+        whitelist.failReplacement = true;
+        sync.syncNow();
+        client.next().result().complete(new WhitelistResult.Snapshot(99, List.of()));
+        applyNext();
+        assertSame(previous, registry.snapshot());
+        assertEquals(1, publications);
+        sync.syncNow();
+        assertEquals(OptionalLong.of(12), client.next().cursor());
+    }
 
     @Test void snapshotReplacesManualUuidsUsingBothApiIdentityTypes() throws Exception {
         whitelist.uuids.add(STALE);
@@ -62,6 +164,8 @@ class WhitelistSynchronizerTest {
         sync.syncNow();
         client.next().result().complete(new WhitelistResult.Unchanged(43));
         assertTrue(mainThread.isEmpty());
+        assertFalse(registry.snapshot().ready());
+        assertEquals(0, publications);
         assertEquals(Set.of(STALE), whitelist.uuids);
         sync.syncNow();
         assertEquals(OptionalLong.of(43), client.next().cursor());
@@ -189,6 +293,8 @@ class WhitelistSynchronizerTest {
         applyNext();
         assertEquals(Set.of(STALE), whitelist.uuids);
         assertNull(whitelist.mutationThread);
+        assertFalse(registry.snapshot().ready());
+        assertEquals(0, publications);
     }
 
     @Test void closingCancelsPendingFetchAndPreventsFurtherRequests() throws Exception {
@@ -243,6 +349,13 @@ class WhitelistSynchronizerTest {
     private record Request(OptionalLong cursor, CompletableFuture<WhitelistResult> result) {}
 
     private static final class FakeClient implements GameAuthClient {
+        @Override public CompletionStage<CrackedLoginResult> crackedLogin(String nickname, char[] password) {
+            if (password != null) java.util.Arrays.fill(password, '\0');
+            return CompletableFuture.completedFuture(new CrackedLoginResult.Unavailable());
+        }
+        @Override public CompletionStage<SessionCheckResult> checkSession(String lease) {
+            return CompletableFuture.completedFuture(new SessionCheckResult.Unavailable());
+        }
         private final BlockingQueue<Request> requests = new LinkedBlockingQueue<>();
         private boolean throwOnFetch;
         private boolean closed;
@@ -272,6 +385,8 @@ class WhitelistSynchronizerTest {
         private boolean onMainThread;
         private boolean failReplacement;
         private Thread mutationThread;
+        private List<WhitelistIdentity> lastIdentities;
+        private Runnable beforeReplacement = () -> {};
 
         @Override public Set<UUID> currentUuids() {
             assertTrue(onMainThread, "Paper reads must stay on the main thread too");
@@ -280,10 +395,12 @@ class WhitelistSynchronizerTest {
 
         @Override public void replaceWith(Collection<WhitelistIdentity> identities) {
             assertTrue(onMainThread, "Paper mutation outside the main-thread executor");
+            beforeReplacement.run();
             if (failReplacement) throw new IllegalStateException("synthetic mutation failure");
             mutationThread = Thread.currentThread();
             uuids.clear();
             identities.forEach(identity -> uuids.add(identity.uuid()));
+            lastIdentities = List.copyOf(identities);
         }
     }
 }

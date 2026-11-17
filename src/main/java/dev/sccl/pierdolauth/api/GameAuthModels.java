@@ -8,6 +8,22 @@ public final class GameAuthModels {
 
     public enum PolicyResult { DENIED, CRACKED, LICENSED, UNAVAILABLE }
 
+    public sealed interface CrackedLoginResult {
+        record Allowed(UUID uuid, String lease, long expiresAtEpochSeconds) implements CrackedLoginResult {
+            @Override public String toString() { return "Allowed[redacted]"; }
+        }
+        record Denied() implements CrackedLoginResult {}
+        record Unavailable() implements CrackedLoginResult {}
+    }
+
+    public sealed interface SessionCheckResult {
+        record Continued(UUID uuid, String lease, long expiresAtEpochSeconds) implements SessionCheckResult {
+            @Override public String toString() { return "Continued[redacted]"; }
+        }
+        record Disconnected() implements SessionCheckResult {}
+        record Unavailable() implements SessionCheckResult {}
+    }
+
     public sealed interface WhitelistResult {
         record Unchanged(long version) implements WhitelistResult {}
         record Snapshot(long version, List<WhitelistIdentity> identities) implements WhitelistResult {

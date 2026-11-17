@@ -3,11 +3,13 @@ package dev.sccl.pierdolauth.config;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -36,6 +38,36 @@ class PluginConfigTest {
 
     private void replace(String original, String replacement) throws IOException {
         Files.writeString(config, yaml.replace(original, replacement));
+    }
+
+    @Test
+    void packagedDefaultsLoadWithSixtySecondIntervalsAndLoginCommand() throws Exception {
+        fixture();
+        YamlConfiguration packaged = new YamlConfiguration();
+        try (var resource = getClass().getResourceAsStream("/config.yml")) {
+            assertNotNull(resource);
+            packaged.load(new InputStreamReader(resource, StandardCharsets.UTF_8));
+        }
+        assertAll(
+                () -> assertEquals(60, packaged.get("whitelist-sync-seconds")),
+                () -> assertEquals(60, packaged.get("session-lease-seconds")),
+                () -> assertEquals("login", packaged.get("login-command")));
+        packaged.set("credential-file", credential.toString());
+        packaged.save(config.toFile());
+        PluginConfig result = new ConfigLoader().load(config);
+        assertAll(
+                () -> assertEquals(Duration.ofSeconds(60), result.whitelistSyncInterval()),
+                () -> assertEquals(Duration.ofSeconds(60), result.sessionLeaseInterval()),
+                () -> assertEquals("login", result.loginCommand()));
+    }
+
+    @Test
+    void rejectsNonintegerLeaseIntervals() throws Exception {
+        fixture();
+        for (String value : new String[] {"1.5", "'60'", "true", "null"}) {
+            replace("session-lease-seconds: 120", "session-lease-seconds: " + value);
+            assertThrows(ConfigurationException.class, () -> new ConfigLoader().load(config));
+        }
     }
 
     @Test

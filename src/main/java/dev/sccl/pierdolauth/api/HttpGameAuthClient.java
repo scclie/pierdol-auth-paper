@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.sccl.pierdolauth.config.ApiCredential;
 import dev.sccl.pierdolauth.config.ConfigurationException;
+import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -17,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -27,7 +29,6 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -68,13 +69,97 @@ public final class HttpGameAuthClient implements GameAuthClient {
     public CompletionStage<PolicyResult> fetchPolicy(String nickname) {
         if (!validNickname(nickname)) return CompletableFuture.completedFuture(PolicyResult.UNAVAILABLE);
         String encoded = URLEncoder.encode(nickname, StandardCharsets.UTF_8).replace("+", "%20");
-        return fetch("/identity-policy?nickname=" + encoded, this::parsePolicy, PolicyResult.UNAVAILABLE);
+        return request("GET", "/identity-policy?nickname=" + encoded, null, this::parsePolicy, PolicyResult.UNAVAILABLE);
     }
 
     @Override
     public CompletionStage<WhitelistResult> fetchWhitelist(OptionalLong cursor) {
         String query = cursor.isPresent() ? "?cursor=" + cursor.getAsLong() : "";
-        return fetch("/whitelist" + query, this::parseWhitelist, new WhitelistResult.Unavailable());
+        return request("GET", "/whitelist" + query, null, this::parseWhitelist, new WhitelistResult.Unavailable());
+    }
+
+    @Override
+    public CompletionStage<CrackedLoginResult> crackedLogin(String nickname, char[] password) {
+        var unavailable = new CrackedLoginResult.Unavailable();
+        try {
+            if (!validNickname(nickname) || password == null) return CompletableFuture.completedFuture(unavailable);
+            byte[] bytes;
+            try (var output = new SensitiveOutput(); var generator = json.createGenerator(output)) {
+                generator.writeStartObject();
+                generator.writeStringField("nickname", nickname);
+                generator.writeFieldName("password");
+                generator.writeString(password, 0, password.length);
+                generator.writeEndObject();
+                generator.flush();
+                bytes = output.toByteArray();
+            }
+            return request("POST", "/cracked-login", bytes, this::parseCrackedLogin, unavailable);
+        } catch (Exception ignored) {
+            return CompletableFuture.completedFuture(unavailable);
+        } finally {
+            if (password != null) Arrays.fill(password, '\0');
+        }
+    }
+
+    @Override
+    public CompletionStage<SessionCheckResult> checkSession(String lease) {
+        var unavailable = new SessionCheckResult.Unavailable();
+        if (!validLease(lease)) return CompletableFuture.completedFuture(unavailable);
+        try {
+            byte[] bytes = json.writeValueAsBytes(java.util.Map.of("lease", lease));
+            return request("POST", "/session-check", bytes, this::parseSessionCheck, unavailable);
+        } catch (Exception ignored) {
+            return CompletableFuture.completedFuture(unavailable);
+        }
+    }
+
+    private CrackedLoginResult parseCrackedLogin(JsonNode value) {
+        if (negativeEnvelope(value, "deny")) return new CrackedLoginResult.Denied();
+        if (!positiveEnvelope(value, "allow")) return new CrackedLoginResult.Unavailable();
+        return new CrackedLoginResult.Allowed(UUID.fromString(value.get("uuid").textValue()),
+                value.get("lease").textValue(), value.get("expires_at").longValue());
+    }
+
+    private SessionCheckResult parseSessionCheck(JsonNode value) {
+        if (negativeEnvelope(value, "disconnect")) return new SessionCheckResult.Disconnected();
+        if (!positiveEnvelope(value, "continue")) return new SessionCheckResult.Unavailable();
+        return new SessionCheckResult.Continued(UUID.fromString(value.get("uuid").textValue()),
+                value.get("lease").textValue(), value.get("expires_at").longValue());
+    }
+
+    private static boolean negativeEnvelope(JsonNode value, String outcome) {
+        return value != null && value.isObject() && value.size() == 2
+                && outcome.equals(value.path("outcome").textValue())
+                && nonnegativeLong(value.path("whitelist_version"));
+    }
+
+    private static boolean positiveEnvelope(JsonNode value, String outcome) {
+        if (value == null || !value.isObject() || value.size() != 5
+                || !outcome.equals(value.path("outcome").textValue())
+                || !nonnegativeLong(value.path("whitelist_version"))
+                || !nonnegativeLong(value.path("expires_at"))
+                || !validLease(value.path("lease").textValue())
+                || !value.path("uuid").isTextual()) return false;
+        String text = value.get("uuid").textValue();
+        return UUID.fromString(text).toString().equalsIgnoreCase(text);
+    }
+
+    private static boolean nonnegativeLong(JsonNode value) {
+        return value.isIntegralNumber() && value.canConvertToLong() && value.longValue() >= 0;
+    }
+
+    private static boolean validLease(String lease) {
+        if (lease == null || lease.length() != 64) return false;
+        for (int index = 0; index < lease.length(); index++) {
+            char value = lease.charAt(index);
+            if (!(value >= '0' && value <= '9') && !(value >= 'a' && value <= 'f')
+                    && !(value >= 'A' && value <= 'F')) return false;
+        }
+        return true;
+    }
+
+    private static final class SensitiveOutput extends ByteArrayOutputStream {
+        @Override public void close() { Arrays.fill(buf, (byte) 0); }
     }
 
     private WhitelistResult parseWhitelist(JsonNode value) {
@@ -128,35 +213,52 @@ public final class HttpGameAuthClient implements GameAuthClient {
         };
     }
 
-    private synchronized <T> CompletionStage<T> fetch(String path, Function<JsonNode, T> parser, T unavailable) {
-        if (closed) return CompletableFuture.completedFuture(unavailable);
+    private synchronized <T> CompletionStage<T> request(String method, String path, byte[] bytes,
+            Function<JsonNode, T> parser, T unavailable) {
+        if (closed) {
+            if (bytes != null) Arrays.fill(bytes, (byte) 0);
+            return CompletableFuture.completedFuture(unavailable);
+        }
         CompletableFuture<T> result = new CompletableFuture<>();
-        Runnable cancel = () -> result.complete(unavailable);
+        java.util.function.Consumer<T> complete = value -> {
+            if (bytes != null) Arrays.fill(bytes, (byte) 0);
+            result.complete(value);
+        };
+        Runnable cancel = () -> complete.accept(unavailable);
         pending.add(cancel);
-        result.whenComplete((value, failure) -> pending.remove(cancel));
+        result.whenComplete((value, failure) -> {
+            pending.remove(cancel);
+        });
         try {
+            HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + path))
+                    .timeout(Duration.ofSeconds(3))
+                    .header("Accept", "application/json")
+                    .header("Cache-Control", "no-store");
+            if ("POST".equals(method)) {
+                builder.header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(bytes));
+            } else {
+                builder.GET();
+            }
+            credential.authorize(builder);
+            HttpRequest request = builder.build();
             executor.execute(() -> {
                 try {
-                    HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(baseUrl + path))
-                            .timeout(Duration.ofSeconds(3))
-                            .header("Accept", "application/json")
-                            .header("Cache-Control", "no-store")
-                            .GET();
-                    credential.authorize(request);
-                    HttpResponse<byte[]> response = http.send(request.build(), new BoundedResponseBodyHandler());
-                    result.complete(response.statusCode() == 200
+                    HttpResponse<byte[]> response = http.send(request, new BoundedResponseBodyHandler());
+                    complete.accept(response.statusCode() == 200
                             ? parser.apply(json.readTree(response.body())) : unavailable);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
-                    result.complete(unavailable);
+                    complete.accept(unavailable);
                 } catch (Exception ignored) {
-                    result.complete(unavailable);
+                    complete.accept(unavailable);
                 }
             });
-        } catch (RejectedExecutionException ignored) {
-            result.complete(unavailable);
+        } catch (RuntimeException ignored) {
+            complete.accept(unavailable);
         }
-        return result;
+        // keep terminal authority with transport/close: public future conversions are detached, so caller mutation cannot wipe bytes still owned by a send.
+        return result.minimalCompletionStage();
     }
 
     private static boolean validNickname(String nickname) {
