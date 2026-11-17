@@ -110,6 +110,10 @@ public final class PaperAdmissionListener implements Listener, AutoCloseable {
     @EventHandler(priority = EventPriority.LOWEST) public void onInteract(PlayerInteractEvent e) { gate(e.getPlayer(), e); }
     @EventHandler(priority = EventPriority.LOWEST) public void onEntityInteract(PlayerInteractEntityEvent e) { gate(e.getPlayer(), e); }
     @EventHandler(priority = EventPriority.LOWEST) public void onEntityInteractAt(PlayerInteractAtEntityEvent e) { gate(e.getPlayer(), e); }
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onEntityTarget(EntityTargetLivingEntityEvent event) {
+        gateEntity(event.getTarget(), event);
+    }
     @EventHandler(priority = EventPriority.LOWEST) public void onDamage(EntityDamageEvent e) { gateEntity(e.getEntity(), e); }
     @EventHandler(priority = EventPriority.LOWEST) public void onDamageByEntity(EntityDamageByEntityEvent e) {
         gateEntity(e.getEntity(), e);

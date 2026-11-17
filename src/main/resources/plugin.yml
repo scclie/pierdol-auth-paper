@@ -7,3 +7,6 @@ commands:
   login:
     usage: /login <password>
     permission: pierdolauth.login
+permissions:
+  pierdolauth.login:
+    default: true
