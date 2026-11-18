@@ -4,10 +4,14 @@
 import argparse
 import base64
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import http.client
 from pathlib import Path
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -18,6 +22,45 @@ class HTTPSOnlyRedirect(urllib.request.HTTPRedirectHandler):
             raise ValueError('Only HTTPS redirects are allowed')
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+
+ #  !!!!!!! TEMPORARY SHIT  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+def range_chunks(url):
+    """Avoid stalled long CDN responses with verified 8 KiB requests."""
+    headers = {'User-Agent': 'pierdol-auth-paper-build/1.0', 'Accept-Encoding': 'identity'}
+    opener = urllib.request.build_opener(HTTPSOnlyRedirect())
+    request = urllib.request.Request(url, headers=headers, method='HEAD')
+    with opener.open(request, timeout=15) as response:
+        size = int(response.headers.get('Content-Length', '0'))
+        download_url = response.geturl()
+    if not 0 < size <= 20 * 1024 * 1024:
+        raise ValueError('Missing or invalid CDN content length')
+
+    def read_range(start):
+        end = min(start + 8191, size - 1)
+        for attempt in range(3):
+            try:
+                request = urllib.request.Request(
+                    download_url, headers={**headers, 'Range': f'bytes={start}-{end}'})
+                opener = urllib.request.build_opener(HTTPSOnlyRedirect())
+                with opener.open(request, timeout=10) as response:
+                    if response.status != 206 or response.headers.get('Content-Range') != f'bytes {start}-{end}/{size}':
+                        raise ValueError('CDN returned an unexpected byte range')
+                    chunk = response.read(end - start + 2)
+                if len(chunk) != end - start + 1:
+                    raise ValueError('CDN returned an incomplete byte range')
+                return chunk
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
+                if attempt == 2:
+                    raise
+                time.sleep(1)
+
+    pool = ThreadPoolExecutor(max_workers=4)
+    try:
+        yield from pool.map(read_range, range(0, size, 8192))
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+ #  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 def fetch(url, sri_sha256, output):
     """Stream to a sibling regular file and atomically publish after verification."""
@@ -43,13 +86,21 @@ def fetch(url, sri_sha256, output):
         ) as target:
             temporary = Path(target.name)
             hasher = hashlib.sha256()
-            opener = urllib.request.build_opener(HTTPSOnlyRedirect())
-            # Spiget rejects the default Python-urllib user agent.
-            request = urllib.request.Request(url, headers={'User-Agent': 'pierdol-auth-paper-build/1.0'})
-            with opener.open(request, timeout=60) as response:
-                while chunk := response.read(1024 * 1024):
-                    target.write(chunk)
-                    hasher.update(chunk)
+
+        # !!!!!!!!!!!!!!!!
+            # opener = urllib.request.build_opener(HTTPSOnlyRedirect())
+            # request = urllib.request.Request(url, headers={'User-Agent': 'pierdol-auth-paper-build/1.0'})
+            # with opener.open(request, timeout=60) as response:
+            #     while chunk := response.read(1024 * 1024):
+            #         target.write(chunk)
+            #         hasher.update(chunk)
+
+            for chunk in range_chunks(url):
+                target.write(chunk)
+                hasher.update(chunk)
+
+        # !!!!!!!!!!!!!!!!
+
         actual_sri = 'sha256-' + base64.b64encode(hasher.digest()).decode('ascii')
         if actual_sri != sri_sha256:
             raise ValueError('SHA-256 verification failed')
