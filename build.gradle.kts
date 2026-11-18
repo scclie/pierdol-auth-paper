@@ -12,9 +12,16 @@ repositories {
     }
 }
 
+val fastLoginJar = providers.environmentVariable("FASTLOGIN_JAR").orNull
+    ?.let { file(it) }
+    ?.takeIf { it.isFile && it.canRead() }
+    ?: throw GradleException("FASTLOGIN_JAR must point to a readable regular FastLogin JAR file.")
+
 dependencies {
     implementation("com.fasterxml.jackson.core:jackson-databind:2.19.2")
     compileOnly("io.papermc.paper:paper-api:26.3.build.253-stable")
+    compileOnly(files(fastLoginJar))
+    testImplementation(files(fastLoginJar))
     testImplementation(platform("org.junit:junit-bom:5.13.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -33,6 +40,7 @@ sourceSets.test {
 
 tasks.test {
     useJUnitPlatform()
+    classpath = classpath.minus(files(fastLoginJar)) + files(fastLoginJar)
     dependsOn(tasks.jar)
     systemProperty("pierdolAuthJar", tasks.jar.get().archiveFile.get().asFile.absolutePath)
     systemProperty("pierdolAuthVersion", project.version.toString())
@@ -52,6 +60,7 @@ tasks.jar {
     from(configurations.runtimeClasspath.map { files -> files.map { zipTree(it) } })
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     exclude("META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA", "**/module-info.class")
+    exclude("com/github/games647/fastlogin/**", "com/comphenix/protocol/**")
 }
 
 dependencyLocking {

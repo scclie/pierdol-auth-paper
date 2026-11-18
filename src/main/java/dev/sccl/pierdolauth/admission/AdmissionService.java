@@ -11,10 +11,13 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * runs on the main thread; callbacks and timers return to it
@@ -33,6 +36,7 @@ public final class AdmissionService implements AutoCloseable {
     }
 
     private final WhitelistRegistry registry;
+    private final BooleanSupplier bridgeReady;
     private final AdmissionActions actions;
     private final GameAuthClient client;
     private final Duration heartbeat;
@@ -47,20 +51,22 @@ public final class AdmissionService implements AutoCloseable {
     private boolean closed;
     private long generation;
 
-    private enum State { FROZEN, LOGIN_PENDING, AUTHENTICATED, RESUME_PENDING }
+    private enum State { FROZEN, LOGIN_PENDING, AUTHENTICATED, RESUME_PENDING, LICENSED_PENDING }
     private static final class Entry {
         final ConnectionIdentity connection;
         final long generation;
         final ConnectionToken token;
+        final ClientType originalType;
         State state = State.FROZEN;
         String lease;
         long expiry;
         Cancellation timer;
         Resume candidate;
-        Entry(ConnectionIdentity connection, long generation) {
+        Entry(ConnectionIdentity connection, long generation, ClientType originalType) {
             this.connection = connection;
             this.generation = generation;
             this.token = new ConnectionToken(connection.uuid());
+            this.originalType = originalType;
         }
     }
     private static final class Resume {
@@ -82,6 +88,13 @@ public final class AdmissionService implements AutoCloseable {
     public AdmissionService(GameAuthClient client, WhitelistRegistry registry, Duration heartbeat,
             Clock clock, Scheduler scheduler, Consumer<Runnable> mainThread, AdmissionActions actions,
             int resumeCapacity) {
+        this(client, registry, heartbeat, clock, scheduler, mainThread, actions, resumeCapacity, () -> false);
+    }
+
+    public AdmissionService(GameAuthClient client, WhitelistRegistry registry, Duration heartbeat,
+            Clock clock, Scheduler scheduler, Consumer<Runnable> mainThread, AdmissionActions actions,
+            int resumeCapacity, BooleanSupplier bridgeReady) {
+        this.bridgeReady = Objects.requireNonNull(bridgeReady);
         this.registry = Objects.requireNonNull(registry);
         this.actions = Objects.requireNonNull(actions);
         this.client = Objects.requireNonNull(client);
@@ -106,9 +119,18 @@ public final class AdmissionService implements AutoCloseable {
         if (!snapshot.ready() || !snapshot.clientTypes().containsKey(uuid)) {
             actions.kick(uuid, UNAVAILABLE);
         } else if (snapshot.clientTypes().get(uuid) == ClientType.LICENSED) {
-            actions.kick(uuid, "Premium authentication is not available yet.");
+            if (!bridgeReady.getAsBoolean()) {
+                actions.kick(uuid, UNAVAILABLE);
+            } else {
+                Entry entry = new Entry(connection, ++generation, ClientType.LICENSED);
+                entry.state = State.LICENSED_PENDING;
+                active.put(uuid, entry);
+                entry.timer = scheduler.schedule(Duration.ofSeconds(10),
+                        () -> dispatch(() -> licensedExpired(entry.token)));
+                return entry.token;
+            }
         } else {
-            Entry entry = new Entry(connection, ++generation);
+            Entry entry = new Entry(connection, ++generation, ClientType.CRACKED);
             active.put(uuid, entry);
             if (candidate != null && Arrays.equals(candidate.address, connection.address())) {
                 entry.state = State.RESUME_PENDING;
@@ -126,6 +148,45 @@ public final class AdmissionService implements AutoCloseable {
         if (token == null) return false;
         Entry entry = active.get(token.uuid);
         return entry != null && entry.token == token && entry.state != State.AUTHENTICATED;
+    }
+
+    private synchronized void licensedExpired(ConnectionToken token) {
+        Entry entry = active.get(token.uuid);
+        if (closed || entry == null || entry.token != token || entry.state != State.LICENSED_PENDING) return;
+        active.remove(token.uuid);
+        if (entry.timer != null) entry.timer.cancel();
+        actions.kick(token.uuid, UNAVAILABLE);
+    }
+
+    public synchronized boolean premiumVerified(ConnectionToken token, UUID uuid, String nickname) {
+        if (closed || token == null || uuid == null || nickname == null || !bridgeReady.getAsBoolean()) return false;
+        Entry entry = active.get(token.uuid);
+        if (entry == null || entry.token != token || entry.originalType != ClientType.LICENSED
+                || entry.state != State.LICENSED_PENDING || !entry.connection.uuid().equals(uuid)) return false;
+        var snapshot = registry.snapshot();
+        var identity = snapshot.identity(uuid);
+        if (!snapshot.ready() || identity == null || identity.clientType() != ClientType.LICENSED
+                || !identity.nickname().toLowerCase(Locale.ROOT).equals(nickname.toLowerCase(Locale.ROOT))
+                || !identity.nickname().toLowerCase(Locale.ROOT).equals(entry.connection.nickname().toLowerCase(Locale.ROOT))) return false;
+        entry.state = State.AUTHENTICATED;
+        if (entry.timer != null) entry.timer.cancel();
+        entry.timer = null;
+        actions.release(uuid);
+        return true;
+    }
+
+    public synchronized void revokeLicensed(WhitelistRegistry.Snapshot snapshot) {
+        if (closed || snapshot != registry.snapshot() || !snapshot.ready()) return;
+        // snapshot iteration and remove-before-kick tolerate synchronous Paper quit callbacks.
+        for (Entry entry : List.copyOf(active.values())) {
+            UUID uuid = entry.connection.uuid();
+            if (entry.originalType == ClientType.LICENSED
+                    && snapshot.clientTypes().get(uuid) != ClientType.LICENSED
+                    && active.remove(uuid, entry)) {
+                if (entry.timer != null) entry.timer.cancel();
+                actions.kick(uuid, "Your authentication session is no longer valid. Please reconnect.");
+            }
+        }
     }
 
     /** Takes ownership of input, including when ignored. */
@@ -228,12 +289,22 @@ public final class AdmissionService implements AutoCloseable {
         if (entry == null || entry.token != token) return;
         active.remove(uuid);
         if (entry.timer != null) entry.timer.cancel();
-        if (entry.state != State.AUTHENTICATED) return;
+        if (entry.state != State.AUTHENTICATED || entry.originalType != ClientType.CRACKED) return;
         sweep();
         resumes.remove(uuid);
         while (resumes.size() >= resumeCapacity) resumes.remove(resumes.keySet().iterator().next());
         resumes.put(uuid, new Resume(entry.connection.address(), ++generation, entry.lease, entry.expiry));
         drive(uuid);
+    }
+
+    /** wailed/kicked connections do not earn a cracked resume or final renewal. */
+    public synchronized void discard(ConnectionToken token) {
+        if (token == null) return;
+        Entry entry = active.get(token.uuid);
+        if (entry != null && entry.token == token) {
+            active.remove(token.uuid);
+            if (entry.timer != null) entry.timer.cancel();
+        }
     }
 
     private void drive(UUID uuid) {

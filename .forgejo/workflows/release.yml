@@ -28,7 +28,15 @@ jobs:
           if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', os.environ['GITHUB_REF_NAME']):
               sys.exit('Expected vMAJOR.MINOR.PATCH without leading zeros')
           PY
+      - name: Fetch verified FastLogin compile-only JAR
+        run: |
+          python3 scripts/fetch-fastlogin-jar.py \
+            --url 'https://api.spiget.org/v2/resources/134322/download?version=636152' \
+            --sri-sha256 'sha256-sxVoz7e4gVCQ2ewDT5z315oue5HPZlAFy7/G7XCEDOs=' \
+            --output "${RUNNER_TEMP}/FastLogin.jar"
       - name: Build one release JAR
+        env:
+          FASTLOGIN_JAR: ${{ runner.temp }}/FastLogin.jar
         run: ./gradlew --no-daemon clean build -PreleaseVersion="${GITHUB_REF_NAME#v}"
       - name: Publish release JAR
         env:
@@ -38,6 +46,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import base64
+          import hashlib
           import json
           import os
           from pathlib import Path
@@ -58,6 +68,8 @@ jobs:
           base = repository_api + '/releases'
           jar = Path('build/libs') / ('pierdol-auth-paper-' + tag[1:] + '.jar')
           require(jar.is_file(), 'Missing release JAR')
+          sri_hash = 'sha256-' + base64.b64encode(hashlib.sha256(jar.read_bytes()).digest()).decode('ascii')
+          release_hash_block = '## Nix SRI SHA-256\n\n```nix\nhash = "' + sri_hash + '";\n```'
 
           def api(method, url, payload=None, attachment=None, missing_ok=False):
               with tempfile.TemporaryDirectory() as directory:
@@ -88,10 +100,17 @@ jobs:
 
           release = api('GET', base + '/tags/' + quote(tag, safe=''), missing_ok=True)
           if release is None:
-              payload = json.dumps({'tag_name': tag, 'name': tag, 'draft': False})
+              payload = json.dumps({'tag_name': tag, 'name': tag, 'draft': False, 'body': release_hash_block})
               release = api('POST', base, payload=payload)
           release_id = validate_release(release)
           release_url = base + '/' + str(release_id)
+          release_body = release.get('body', '')
+          require(isinstance(release_body, str), 'Invalid release body')
+          if release_hash_block not in release_body:
+              separator = '\n\n' if release_body else ''
+              release = api('PATCH', release_url, payload=json.dumps({'body': release_body + separator + release_hash_block}))
+              release_id = validate_release(release)
+              release_url = base + '/' + str(release_id)
 
           def assets():
               found = {}

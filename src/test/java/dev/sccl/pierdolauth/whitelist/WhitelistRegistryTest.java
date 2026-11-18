@@ -14,6 +14,29 @@ class WhitelistRegistryTest {
     private static final UUID UUID_TWO = UUID.fromString("00000000-0000-0000-0000-000000000002");
     private final WhitelistRegistry registry = new WhitelistRegistry();
 
+    @Test void firstPublicationRetainsImmutableIdentitiesWithUuidAndCaseInsensitiveNicknameLookup() {
+        var cracked = new WhitelistIdentity("Player", ClientType.CRACKED, UUID_ONE);
+        var licensed = new WhitelistIdentity("LiCeNsEd", ClientType.LICENSED, UUID_TWO);
+        registry.publish(List.of(cracked, licensed));
+        var snapshot = registry.snapshot();
+        assertEquals(Map.of(UUID_ONE, cracked, UUID_TWO, licensed), snapshot.identities());
+        assertSame(licensed, snapshot.identity(UUID_TWO));
+        assertSame(licensed, snapshot.identity("licensed"));
+        assertSame(licensed, snapshot.identity("LICENSED"));
+        assertNull(snapshot.identity("missing"));
+        assertThrows(UnsupportedOperationException.class,
+                () -> snapshot.identities().put(UUID_TWO, cracked));
+    }
+
+    @Test void ambiguousNormalizedNicknamesRejectEntirePublication() {
+        registry.publish(List.of(new WhitelistIdentity("Current", ClientType.CRACKED, UUID_ONE)));
+        var previous = registry.snapshot();
+        assertThrows(IllegalArgumentException.class, () -> registry.publish(List.of(
+                new WhitelistIdentity("Player", ClientType.CRACKED, UUID_ONE),
+                new WhitelistIdentity("player", ClientType.LICENSED, UUID_TWO))));
+        assertSame(previous, registry.snapshot());
+    }
+
     @Test void firstPublicationMakesExactClientTypesReady() {
         assertFalse(registry.snapshot().ready());
         assertEquals(Map.of(), registry.snapshot().clientTypes());

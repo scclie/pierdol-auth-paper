@@ -29,6 +29,98 @@ class PluginLifecycleTest {
     @TempDir Path directory;
     private boolean failureGuardRegistered;
 
+    @Test void deferredOptionalLinkageClosesInstalledBridgeBeforeCrackedOnlyPublication() throws Exception {
+        var integration = new PierdolAuthPlugin.FastLoginIntegration();
+        var hook = new java.util.concurrent.atomic.AtomicReference<com.github.games647.fastlogin.core.hooks.AuthPlugin<org.bukkit.entity.Player>>();
+        var refresh = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+        var initialized = new java.util.concurrent.atomic.AtomicBoolean();
+        var cancelled = new java.util.concurrent.atomic.AtomicBoolean();
+        var identities = java.util.List.of(
+                new WhitelistIdentity("Cracked", ClientType.CRACKED, UUID.randomUUID()),
+                new WhitelistIdentity("Licensed", ClientType.LICENSED, UUID.randomUUID()));
+        var storage = new com.github.games647.fastlogin.core.storage.AuthStorage() {
+            public com.github.games647.fastlogin.core.storage.StoredProfile loadProfile(String name) {
+                throw new NoSuchMethodError("deferred typed API failure");
+            }
+            public com.github.games647.fastlogin.core.storage.StoredProfile loadProfile(UUID uuid) {
+                throw new AssertionError("failed dependency must not be reused");
+            }
+            public void save(com.github.games647.fastlogin.core.storage.StoredProfile profile) {
+                throw new AssertionError("no save after linkage failure");
+            }
+            public int deleteProfile(String name) { throw new AssertionError("no delete"); }
+            public void close() { throw new AssertionError("storage not owned"); }
+        };
+        var synchronizer = new java.util.concurrent.atomic.AtomicReference<WhitelistSynchronizer>();
+        try (var lifecycle = new PluginLifecycle(this::validConfig, config -> client,
+                (http, config, shared) -> {
+                    registry = shared;
+                    var value = new WhitelistSynchronizer(http, new PaperWhitelist() {
+                        public Set<UUID> currentUuids() { throw new AssertionError("no read"); }
+                        public void replaceWith(Collection<WhitelistIdentity> entries) {}
+                    }, config.whitelistSyncInterval(), mainThread::add, snapshot -> {
+                        assertFalse(integration.ready(), "no successful enabled projection publication");
+                        assertNull(hook.get(), "installed bridge closed before publication/revocation");
+                        assertTrue(cancelled.get());
+                        PierdolAuthPlugin.publication(shared, () -> null).accept(snapshot);
+                    }, new dev.sccl.pierdolauth.licensed.FastLoginProjection(storage, () -> false, integration::close));
+                    synchronizer.set(value);
+                    return value;
+                }, failureGuard(() -> failureGuardRegistered = true))) {
+            assertTrue(lifecycle.enable());
+            var bridge = new dev.sccl.pierdolauth.licensed.FastLoginBridge(
+                    new dev.sccl.pierdolauth.licensed.FastLoginBridge.Platform() {
+                        public boolean enabled() { return true; }
+                        public boolean initialized() { return initialized.get(); }
+                        public com.github.games647.fastlogin.core.hooks.AuthPlugin<org.bukkit.entity.Player> hook() { return hook.get(); }
+                        public void hook(com.github.games647.fastlogin.core.hooks.AuthPlugin<org.bukkit.entity.Player> next) { hook.set(next); }
+                        public void register(org.bukkit.event.Listener listener) {}
+                        public dev.sccl.pierdolauth.admission.AdmissionService.Cancellation monitor(Runnable task) {
+                            refresh.set(task);
+                            return () -> cancelled.set(true);
+                        }
+                    }, registry, null);
+            integration.install(new PierdolAuthPlugin.BridgeOwner() {
+                public boolean ready() { return bridge.ready(); }
+                public void close() { bridge.close(); }
+            });
+            initialized.set(true);
+            refresh.get().run();
+            assertTrue(integration.ready());
+            client.next().complete(new WhitelistResult.Snapshot(42, identities));
+            var apply = mainThread.poll(1, TimeUnit.SECONDS);
+            assertNotNull(apply);
+            apply.run();
+            var completion = mainThread.poll(2, TimeUnit.SECONDS);
+            assertNotNull(completion);
+            assertFalse(registry.snapshot().ready(), "no failed enabled candidate publication");
+            completion.run();
+            assertTrue(registry.snapshot().ready(), "disabled/no-op snapshot keeps cracked registry online");
+            assertFalse(failureGuardRegistered);
+            assertFalse(integration.ready());
+            assertFalse(bridge.ready());
+            assertFalse(bridge.forceLogin(null), "old bridge cannot release from cache/snapshot alone");
+            refresh.get().run();
+            assertFalse(integration.ready(), "readiness monitor cannot restore invalid integration");
+            integration.install(new PierdolAuthPlugin.BridgeOwner() {
+                public boolean ready() { return true; }
+                public void close() { cancelled.set(true); }
+            });
+            assertFalse(integration.ready(), "late bridge installation cannot undo degradation");
+            client.expectedCursor = OptionalLong.of(42);
+            synchronizer.get().syncNow();
+            client.next().complete(new WhitelistResult.Snapshot(43, identities));
+            var later = mainThread.poll(1, TimeUnit.SECONDS);
+            assertNotNull(later);
+            later.run();
+            assertTrue(mainThread.isEmpty(), "future disabled projection is a synchronous no-op");
+            assertTrue(registry.snapshot().ready());
+            assertFalse(integration.ready());
+        } finally {
+            integration.close();
+        }
+    }
+
     @Test void admissionShutdownPrecedesSynchronizerAndClientAndIgnoresLateCallbacks() throws Exception {
         var order = new java.util.ArrayList<String>();
         var queued = new java.util.ArrayList<Runnable>();
@@ -290,12 +382,13 @@ class PluginLifecycleTest {
         private final BlockingQueue<CompletableFuture<WhitelistResult>> requests = new LinkedBlockingQueue<>();
         private Runnable onClose = () -> {};
         private boolean closed;
+        private OptionalLong expectedCursor = OptionalLong.empty();
 
         @Override public CompletionStage<PolicyResult> fetchPolicy(String nickname) {
             throw new AssertionError("lifecycle must not request player policy");
         }
         @Override public CompletionStage<WhitelistResult> fetchWhitelist(OptionalLong cursor) {
-            assertEquals(OptionalLong.empty(), cursor);
+            assertEquals(expectedCursor, cursor);
             CompletableFuture<WhitelistResult> pending = new CompletableFuture<>();
             requests.add(pending);
             return pending;

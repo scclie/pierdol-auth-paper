@@ -4,6 +4,9 @@ import static dev.sccl.pierdolauth.api.GameAuthModels.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 import dev.sccl.pierdolauth.api.GameAuthClient;
+import dev.sccl.pierdolauth.licensed.FastLoginProjection;
+import com.github.games647.fastlogin.core.storage.AuthStorage;
+import com.github.games647.fastlogin.core.storage.StoredProfile;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashSet;
@@ -19,6 +22,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class WhitelistSynchronizerTest {
     private static final UUID STALE = UUID.fromString("00000000-0000-0000-0000-000000000001");
@@ -44,6 +49,182 @@ class WhitelistSynchronizerTest {
             });
 
     @AfterEach void close() { sync.close(); }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"method", "abstract", "class"})
+    void deferredLinkageCompletesOnlyAsDisabledAndAllowsFurtherFetches(String failure) throws Exception {
+        var storage = new ProjectionStorage(Thread.currentThread());
+        storage.linkage = switch (failure) {
+            case "method" -> new NoSuchMethodError("deferred test failure");
+            case "abstract" -> new AbstractMethodError("deferred test failure");
+            default -> new NoClassDefFoundError("deferred test failure");
+        };
+        try (var enabled = enabledSynchronizer(storage)) {
+            var before = registry.snapshot();
+            enabled.syncNow();
+            client.next().result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+            applyNext();
+            Runnable completion = mainThread.poll(2, TimeUnit.SECONDS);
+            assertNotNull(completion, "optional linkage must not strand the in-flight worker");
+            assertSame(before, registry.snapshot());
+            assertEquals(0, publications, "failed enabled candidate must not publish/revoke");
+            enabled.syncNow();
+            assertTrue(client.requests.isEmpty());
+            runMain(completion);
+            assertTrue(registry.snapshot().ready(), "disabled/no-op completion preserves cracked operation");
+            assertEquals(ClientType.CRACKED, registry.snapshot().clientTypes().get(CRACKED));
+            assertEquals(1, publications);
+            assertEquals(1, storage.linkageCalls);
+            enabled.syncNow();
+            Request later = client.next();
+            assertEquals(OptionalLong.of(42), later.cursor());
+            later.result().complete(new WhitelistResult.Snapshot(43, IDENTITIES));
+            applyNext();
+            assertEquals(2, publications, "future snapshots use the successful disabled/no-op projection");
+            assertEquals(1, storage.linkageCalls, "unavailable optional API must never be retried");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void realProjectionFailureRetainsPublicationAndCursorThenRetriesOnce(boolean previous) throws Exception {
+        var storage = new ProjectionStorage(Thread.currentThread());
+        try (var enabled = enabledSynchronizer(storage)) {
+            if (previous) {
+                enabled.syncNow();
+                client.next().result().complete(new WhitelistResult.Snapshot(12, List.of(IDENTITIES.getFirst())));
+                applyNext();
+                applyNext();
+            }
+            var before = registry.snapshot();
+            int count = publications;
+            storage.drop = true;
+            enabled.syncNow();
+            client.next().result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+            applyNext(); // paper mutation submits real projection to its worker
+            Runnable completion = mainThread.poll(2, TimeUnit.SECONDS);
+            assertNotNull(completion);
+            assertSame(before, registry.snapshot());
+            assertEquals(count, publications);
+            enabled.syncNow();
+            assertTrue(client.requests.isEmpty(), "queued projection completion remains in flight");
+            runMain(completion);
+            assertSame(before, registry.snapshot());
+            assertEquals(count, publications, "failure must not notify publisher/revocation consumer");
+            enabled.syncNow();
+            Request retry = client.next();
+            assertEquals(previous ? OptionalLong.of(12) : OptionalLong.empty(), retry.cursor());
+            storage.drop = false;
+            retry.result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+            applyNext();
+            assertEquals(count, publications);
+            applyNext();
+            assertEquals(count + 1, publications);
+            assertEquals(IDENTITIES.size(), registry.snapshot().identities().size());
+            enabled.syncNow();
+            assertEquals(OptionalLong.of(42), client.next().cursor());
+        }
+    }
+
+    @Test void optionalRuntimeFailureDoesNotDisableOrPublishAndRetriesEnabledStorage() throws Exception {
+        var storage = new ProjectionStorage(Thread.currentThread());
+        storage.runtime = true;
+        try (var enabled = enabledSynchronizer(storage)) {
+            var before = registry.snapshot();
+            enabled.syncNow();
+            client.next().result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+            applyNext();
+            applyNext();
+            assertSame(before, registry.snapshot());
+            assertEquals(0, publications);
+            assertFalse(storage.disabled);
+            enabled.syncNow();
+            var retry = client.next();
+            assertEquals(OptionalLong.empty(), retry.cursor());
+            storage.runtime = false;
+            retry.result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+            applyNext();
+            applyNext();
+            assertEquals(1, publications);
+            assertNotNull(storage.persisted, "retry must confirm enabled storage, not bypass it");
+            assertFalse(storage.disabled);
+        }
+    }
+
+    @Test void closeSuppressesRealProjectionQueuedCompletion() throws Exception {
+        var storage = new ProjectionStorage(Thread.currentThread());
+        try (var enabled = enabledSynchronizer(storage)) {
+            enabled.syncNow();
+            client.next().result().complete(new WhitelistResult.Snapshot(42, IDENTITIES));
+            applyNext();
+            Runnable completion = mainThread.poll(2, TimeUnit.SECONDS);
+            assertNotNull(completion, "worker must finish before close");
+            assertNotNull(storage.persisted);
+            enabled.close();
+            runMain(completion);
+            assertFalse(registry.snapshot().ready());
+            assertEquals(0, publications);
+            enabled.syncNow();
+            assertTrue(client.requests.isEmpty());
+        }
+    }
+
+    private WhitelistSynchronizer enabledSynchronizer(ProjectionStorage storage) {
+        return new WhitelistSynchronizer(client, whitelist, Duration.ofHours(1), mainThread::add,
+                snapshot -> {
+                    assertTrue(whitelist.onMainThread);
+                    assertEquals(storage.main, Thread.currentThread());
+                    assertEquals(snapshot.identities(), whitelist.lastIdentities);
+                    if (storage.linkage != null) assertTrue(storage.disabled);
+                    publications++;
+                    registry.publish(snapshot.identities());
+                }, new FastLoginProjection(storage, () -> Thread.currentThread() == storage.main,
+                        () -> {
+                            assertEquals(storage.main, Thread.currentThread());
+                            assertEquals(0, publications, "invalidate before disabled publication/revocation");
+                            storage.disabled = true;
+                        }));
+    }
+
+    private static final class ProjectionStorage implements AuthStorage {
+        private final Thread main;
+        private StoredProfile persisted;
+        private boolean drop;
+        private LinkageError linkage;
+        private int linkageCalls;
+        private boolean runtime;
+        private boolean disabled;
+
+        private ProjectionStorage(Thread main) { this.main = main; }
+        private void offThread() { assertNotEquals(main, Thread.currentThread()); }
+        private StoredProfile copy() {
+            return persisted == null ? null : new StoredProfile(persisted.getRowId(), persisted.getId(),
+                    persisted.getName(), persisted.isPremium(), persisted.getFloodgate(),
+                    persisted.getLastIp(), persisted.getLastLogin());
+        }
+        @Override public StoredProfile loadProfile(String name) {
+            offThread();
+            if (runtime) throw new IllegalStateException("ordinary storage failure");
+            if (linkage != null) {
+                linkageCalls++;
+                throw linkage;
+            }
+            return persisted != null && persisted.getName().equals(name)
+                    ? copy() : new StoredProfile(null, name, false, "");
+        }
+        @Override public StoredProfile loadProfile(UUID uuid) {
+            offThread();
+            return persisted != null && uuid.equals(persisted.getId()) ? copy() : null;
+        }
+        @Override public void save(StoredProfile profile) {
+            offThread();
+            if (drop || profile.getLastIp() == null) return;
+            persisted = new StoredProfile(0, profile.getId(), profile.getName(), profile.isPremium(),
+                    profile.getFloodgate(), profile.getLastIp(), profile.getLastLogin());
+        }
+        @Override public int deleteProfile(String name) { throw new AssertionError("no deletion"); }
+        @Override public void close() { throw new AssertionError("not owned"); }
+    }
 
     @Test void replacementCompletesBeforeMetadataPublicationAndCursorAdvance() throws Exception {
         whitelist.beforeReplacement = () -> {
@@ -342,6 +523,10 @@ class WhitelistSynchronizerTest {
     private void applyNext() throws Exception {
         Runnable task = mainThread.poll(1, TimeUnit.SECONDS);
         assertNotNull(task, "snapshot must be dispatched to the main-thread executor");
+        runMain(task);
+    }
+
+    private void runMain(Runnable task) {
         whitelist.onMainThread = true;
         try { task.run(); } finally { whitelist.onMainThread = false; }
     }

@@ -42,7 +42,7 @@ class AdmissionServiceTest {
     @Test void licensedUuidCannotEnter() throws Exception {
         publish(ClientType.LICENSED);
         join(connection());
-        assertEquals(List.of("Premium authentication is not available yet."), actions.messages);
+        assertEquals(List.of(UNAVAILABLE), actions.messages);
         assertTrue(actions.kicked.contains(id));
     }
 
@@ -52,6 +52,235 @@ class AdmissionServiceTest {
         assertTrue(service.frozen(tokens.get(id)));
         assertEquals(1, actions.prompts);
         assertEquals(0, client.logins.size() + client.checks.size());
+    }
+
+    private boolean ready = true;
+    private AdmissionService licensedService() {
+        return new AdmissionService(client, registry, Duration.ofSeconds(60), clock, scheduler,
+                main::add, actions, 2, () -> ready);
+    }
+
+    @Test void premiumProofReleasesOnceCancelsQueuedExpiryAndNeverCreatesCrackedResume() throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            scheduler.fire(Duration.ofSeconds(10));
+            assertTrue(licensed.premiumVerified(token, id, "pLaYeR"));
+            assertFalse(licensed.frozen(token));
+            assertFalse(licensed.premiumVerified(token, id, "Player"));
+            drain();
+            assertEquals(1, actions.releases);
+            assertTrue(actions.kicked.isEmpty());
+            assertEquals(0, scheduler.live(Duration.ofSeconds(60)));
+            licensed.quit(token);
+            publish(ClientType.CRACKED);
+            var cracked = licensed.join(connection());
+            assertTrue(licensed.frozen(cracked));
+            assertEquals(1, actions.prompts);
+            assertTrue(client.checks.isEmpty());
+            assertTrue(client.logins.isEmpty());
+        }
+    }
+
+    @ParameterizedTest @ValueSource(ints = {0, 1, 2, 3, 4, 5, 6, 7, 8})
+    void invalidPremiumProofNeverGrantsOrCancelsDeadline(int mismatch) throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var connection = mismatch == 8
+                    ? new ConnectionIdentity(id, "Other", InetAddress.getLoopbackAddress()) : connection();
+            var token = licensed.join(connection);
+            UUID proofId = id;
+            String name = "Player";
+            switch (mismatch) {
+                case 0 -> proofId = UUID.randomUUID();
+                case 1 -> name = "Other";
+                case 2 -> publish(ClientType.CRACKED);
+                case 3 -> registry.publish(List.of());
+                case 4 -> ready = false;
+                case 5 -> licensed.join(connection());
+                case 6 -> licensed.quit(token);
+                case 7 -> licensed.close();
+            }
+            assertFalse(licensed.premiumVerified(token, proofId, name));
+            assertEquals(0, actions.releases);
+            assertTrue(client.logins.isEmpty());
+            assertTrue(client.checks.isEmpty());
+            if (mismatch < 5 || mismatch == 8) {
+                assertTrue(licensed.frozen(token));
+                assertEquals(1, scheduler.live(Duration.ofSeconds(10)));
+            }
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void publishedRevocationRemovesOriginalLicensedPendingOrAuthenticatedButNotCracked(boolean verified) throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            if (verified) assertTrue(licensed.premiumVerified(token, id, "Player"));
+            licensed.revokeLicensed(registry.snapshot());
+            assertTrue(actions.kicked.isEmpty());
+            publish(ClientType.CRACKED);
+            licensed.revokeLicensed(registry.snapshot());
+            assertEquals(List.of("Your authentication session is no longer valid. Please reconnect."), actions.messages);
+            assertFalse(licensed.frozen(token));
+            assertEquals(0, scheduler.live(Duration.ofSeconds(10)));
+            licensed.quit(token);
+            assertTrue(client.checks.isEmpty());
+            actions.messages.clear(); actions.kicked.clear();
+            var cracked = licensed.join(connection());
+            registry.publish(List.of());
+            licensed.revokeLicensed(registry.snapshot());
+            assertTrue(licensed.frozen(cracked));
+            assertTrue(actions.kicked.isEmpty());
+        }
+    }
+
+    @Test void unreadyOrUnpublishedRevocationCannotChangeCurrentLicensedEntry() throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            licensed.revokeLicensed(new WhitelistRegistry().snapshot());
+            WhitelistRegistry other = new WhitelistRegistry(); other.publish(List.of());
+            licensed.revokeLicensed(other.snapshot());
+            assertTrue(licensed.frozen(token));
+            assertTrue(actions.kicked.isEmpty());
+        }
+    }
+
+    @Test void licensedRevocationToleratesSynchronousQuitAndQueuedTimeoutReentry() throws Exception {
+        UUID second = UUID.randomUUID();
+        registry.publish(List.of(new WhitelistIdentity("Player", ClientType.LICENSED, id),
+                new WhitelistIdentity("Second", ClientType.LICENSED, second)));
+        try (var licensed = licensedService()) {
+            var first = licensed.join(connection());
+            var other = licensed.join(new ConnectionIdentity(second, "Second", InetAddress.getLoopbackAddress()));
+            scheduler.fire(Duration.ofSeconds(10));
+            actions.onKick = uuid -> { licensed.quit(first); licensed.quit(other); };
+            registry.publish(List.of());
+            assertDoesNotThrow(() -> licensed.revokeLicensed(registry.snapshot()));
+            drain();
+            // Synchronous quit may remove the other entry before iteration reaches it.
+            assertFalse(licensed.frozen(first));
+            assertFalse(licensed.frozen(other));
+            assertFalse(actions.kicked.isEmpty());
+            assertTrue(actions.messages.stream().allMatch(message -> message.equals(
+                    "Your authentication session is no longer valid. Please reconnect.")));
+            assertTrue(client.checks.isEmpty());
+        }
+    }
+
+    @Test void currentUnreadySnapshotAndOriginalCrackedEntryCannotAcceptPremiumProof() throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            registry.publish(new WhitelistRegistry().snapshot());
+            assertFalse(licensed.premiumVerified(token, id, "Player"));
+            assertTrue(licensed.frozen(token));
+            publish(ClientType.CRACKED);
+            var cracked = licensed.join(connection());
+            publish(ClientType.LICENSED);
+            assertFalse(licensed.premiumVerified(cracked, id, "Player"));
+            registry.publish(List.of());
+            licensed.revokeLicensed(registry.snapshot());
+            assertTrue(licensed.frozen(cracked));
+            assertTrue(actions.kicked.isEmpty());
+        }
+    }
+
+    @Test void pluginPublicationPublishesBeforeRevokingAndToleratesAdmissionNotConstructedYet() throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            var publisher = dev.sccl.pierdolauth.PierdolAuthPlugin.publication(registry, () -> licensed);
+            publisher.accept(new WhitelistResult.Snapshot(2, List.of()));
+            assertTrue(registry.snapshot().ready());
+            assertTrue(registry.snapshot().identities().isEmpty());
+            assertFalse(licensed.frozen(token), "Published revocation must invalidate licensed connection");
+            assertTrue(actions.kicked.contains(id));
+            dev.sccl.pierdolauth.PierdolAuthPlugin.publication(registry, () -> null)
+                    .accept(new WhitelistResult.Snapshot(3, List.of(new WhitelistIdentity("Player", ClientType.CRACKED, id))));
+            assertEquals(ClientType.CRACKED, registry.snapshot().clientTypes().get(id));
+        }
+    }
+
+    @ParameterizedTest @ValueSource(ints = {0, 1, 2})
+    void synchronizerRevokesOnlyAfterSuccessfulOpenPublication(int outcome) throws Exception {
+        publish(ClientType.LICENSED);
+        BlockingQueue<Runnable> publications = new LinkedBlockingQueue<>();
+        client.whitelist = CompletableFuture.completedFuture(new WhitelistResult.Snapshot(2, List.of()));
+        try (var licensed = licensedService();
+                var synchronizer = new dev.sccl.pierdolauth.whitelist.WhitelistSynchronizer(client,
+                        new dev.sccl.pierdolauth.whitelist.PaperWhitelist() {
+                            public Set<UUID> currentUuids() { return Set.of(); }
+                            public void replaceWith(Collection<WhitelistIdentity> identities) {}
+                        }, Duration.ofHours(1), publications::add,
+                        dev.sccl.pierdolauth.PierdolAuthPlugin.publication(registry, () -> licensed),
+                        snapshot -> outcome != 1)) {
+            var token = licensed.join(connection());
+            synchronizer.syncNow();
+            Runnable apply = publications.poll(2, TimeUnit.SECONDS); assertNotNull(apply); apply.run();
+            Runnable complete = publications.poll(2, TimeUnit.SECONDS); assertNotNull(complete);
+            assertTrue(licensed.frozen(token));
+            assertEquals(ClientType.LICENSED, registry.snapshot().clientTypes().get(id));
+            if (outcome == 2) synchronizer.close();
+            complete.run();
+            assertEquals(outcome == 0, actions.kicked.contains(id));
+            assertEquals(outcome != 0, licensed.frozen(token));
+            assertEquals(outcome == 0, registry.snapshot().identities().isEmpty());
+        }
+    }
+
+    @Test void readyLicensedJoinsFrozenWithoutPasswordOrSessionAndExpiresAtTenSeconds() throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            assertTrue(licensed.frozen(token), "Ready licensed connection must remain frozen pending proof");
+            assertTrue(actions.kicked.isEmpty());
+            assertEquals(0, actions.prompts);
+            char[] password = input();
+            licensed.command(token, password);
+            assertCleared(password);
+            licensed.command(token, new char[0]);
+            assertEquals(0, actions.prompts);
+            assertTrue(client.logins.isEmpty());
+            assertTrue(client.checks.isEmpty());
+            assertEquals(1, scheduler.live(Duration.ofSeconds(10)));
+            assertEquals(0, scheduler.live(Duration.ofSeconds(60)));
+            scheduler.fire(Duration.ofSeconds(10));
+            assertTrue(actions.kicked.isEmpty(), "Timer must dispatch to main thread");
+            drain();
+            assertEquals(List.of(UNAVAILABLE), actions.messages);
+            assertFalse(licensed.frozen(token));
+        }
+    }
+
+    @ParameterizedTest @ValueSource(ints = {0, 1, 2})
+    void queuedLicensedExpiryCannotAffectReplacementQuitOrClose(int lifecycle) throws Exception {
+        publish(ClientType.LICENSED);
+        try (var licensed = licensedService()) {
+            var token = licensed.join(connection());
+            assertTrue(licensed.frozen(token));
+            scheduler.fire(Duration.ofSeconds(10));
+            switch (lifecycle) {
+                case 0 -> licensed.join(connection());
+                case 1 -> licensed.quit(token);
+                case 2 -> licensed.close();
+            }
+            drain();
+            assertTrue(actions.kicked.isEmpty());
+            assertTrue(client.checks.isEmpty());
+        }
+    }
+
+    @Test void readinessIsCheckedAgainAtLicensedJoin() throws Exception {
+        publish(ClientType.LICENSED);
+        ready = false;
+        try (var licensed = licensedService()) {
+            assertFalse(licensed.frozen(licensed.join(connection())));
+            assertEquals(List.of(UNAVAILABLE), actions.messages);
+            assertEquals(0, scheduler.live(Duration.ofSeconds(10)));
+        }
     }
 
     @Test void addressOwnershipAndComparisonAreDefensive() throws Exception {
@@ -500,9 +729,10 @@ class AdmissionServiceTest {
         quitRenewed();
         for (int index = 0; index < 2; index++) {
             UUID other = UUID.randomUUID();
-            registry.publish(List.of(new WhitelistIdentity("Player", ClientType.CRACKED, other),
+            String otherNickname = "Player" + index;
+            registry.publish(List.of(new WhitelistIdentity(otherNickname, ClientType.CRACKED, other),
                     new WhitelistIdentity("Player", ClientType.CRACKED, id)));
-            join(new ConnectionIdentity(other, "Player", InetAddress.getByAddress(new byte[] {127, 0, 0, 1})));
+            join(new ConnectionIdentity(other, otherNickname, InetAddress.getByAddress(new byte[] {127, 0, 0, 1})));
             service.command(tokens.get(other), input());
             client.logins.getLast().complete(allowed(other, 1_300));
             drain();
@@ -924,6 +1154,7 @@ class AdmissionServiceTest {
     }
 
     private static final class Actions implements AdmissionActions {
+        java.util.function.Consumer<UUID> onKick = uuid -> {};
         final List<String> messages = new ArrayList<>();
         final Set<UUID> kicked = new HashSet<>();
         int prompts;
@@ -931,10 +1162,11 @@ class AdmissionServiceTest {
         public void prompt(UUID uuid) { prompts++; }
         public void message(UUID uuid, String message) { messages.add(message); }
         public void release(UUID uuid) { releases++; }
-        public void kick(UUID uuid, String reason) { kicked.add(uuid); messages.add(reason); }
+        public void kick(UUID uuid, String reason) { kicked.add(uuid); messages.add(reason); onKick.accept(uuid); }
     }
 
     private static final class FakeClient implements GameAuthClient {
+        CompletableFuture<WhitelistResult> whitelist;
         final List<CompletableFuture<CrackedLoginResult>> logins = new ArrayList<>();
         final List<CompletableFuture<SessionCheckResult>> checks = new ArrayList<>();
         final List<String> checkInputs = new ArrayList<>();
@@ -971,7 +1203,10 @@ class AdmissionServiceTest {
             return future;
         }
         public CompletionStage<PolicyResult> fetchPolicy(String nickname) { throw new AssertionError(); }
-        public CompletionStage<WhitelistResult> fetchWhitelist(OptionalLong cursor) { throw new AssertionError(); }
+        public CompletionStage<WhitelistResult> fetchWhitelist(OptionalLong cursor) {
+            if (whitelist == null) throw new AssertionError();
+            return whitelist;
+        }
         public void close() { throw new AssertionError(); }
     }
 }
