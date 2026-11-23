@@ -14,7 +14,9 @@ public interface GameAuthClient extends AutoCloseable {
     // ownership of the mutable input transfers to the client at method invocation, even if it throws synchronously. the caller must never mutate it afterward
     CompletionStage<CrackedLoginResult> crackedLogin(String nickname, char[] password);
     CompletionStage<SessionCheckResult> checkSession(String lease);
-    CompletionStage<CrackedLoginResult> premiumVerified(String nickname, UUID mojangUuid);
+    default CompletionStage<CrackedLoginResult> premiumVerified(String nickname, UUID mojangUuid) {
+        return CompletableFuture.completedFuture(new CrackedLoginResult.Unavailable());
+    }
     default CompletionStage<Boolean> creditActiveMinutes(Collection<Long> userIds) {
         return CompletableFuture.completedFuture(false);
     }

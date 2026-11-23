@@ -149,6 +149,8 @@ public final class HttpGameAuthClient implements GameAuthClient {
     private CrackedLoginResult parseCrackedLogin(JsonNode value) {
         if (negativeEnvelope(value, "deny")) return new CrackedLoginResult.Denied();
         if (!positiveEnvelope(value, "allow")) return new CrackedLoginResult.Unavailable();
+        if (value.size() == 5) return new CrackedLoginResult.Allowed(UUID.fromString(value.get("uuid").textValue()),
+                value.get("lease").textValue(), value.get("expires_at").longValue());
         return new CrackedLoginResult.Allowed(UUID.fromString(value.get("uuid").textValue()),
                 value.get("lease").textValue(), value.get("expires_at").longValue(), value.get("user_id").longValue());
     }
@@ -156,6 +158,8 @@ public final class HttpGameAuthClient implements GameAuthClient {
     private SessionCheckResult parseSessionCheck(JsonNode value) {
         if (negativeEnvelope(value, "disconnect")) return new SessionCheckResult.Disconnected();
         if (!positiveEnvelope(value, "continue")) return new SessionCheckResult.Unavailable();
+        if (value.size() == 5) return new SessionCheckResult.Continued(UUID.fromString(value.get("uuid").textValue()),
+                value.get("lease").textValue(), value.get("expires_at").longValue());
         return new SessionCheckResult.Continued(UUID.fromString(value.get("uuid").textValue()),
                 value.get("lease").textValue(), value.get("expires_at").longValue(), value.get("user_id").longValue());
     }
@@ -167,11 +171,12 @@ public final class HttpGameAuthClient implements GameAuthClient {
     }
 
     private static boolean positiveEnvelope(JsonNode value, String outcome) {
-        if (value == null || !value.isObject() || value.size() != 6
+        if (value == null || !value.isObject() || (value.size() != 5 && value.size() != 6)
                 || !outcome.equals(value.path("outcome").textValue())
                 || !nonnegativeLong(value.path("whitelist_version"))
                 || !nonnegativeLong(value.path("expires_at"))
-                || !nonnegativeLong(value.path("user_id")) || value.path("user_id").longValue() == 0
+                || (value.size() == 6 && (!nonnegativeLong(value.path("user_id"))
+                        || value.path("user_id").longValue() == 0))
                 || !validLease(value.path("lease").textValue())
                 || !value.path("uuid").isTextual()) return false;
         String text = value.get("uuid").textValue();

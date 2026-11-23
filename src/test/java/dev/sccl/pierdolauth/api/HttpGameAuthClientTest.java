@@ -51,7 +51,7 @@ class HttpGameAuthClientTest {
         assertEquals(AUTH_UUID, result.uuid());
         assertTrue(syntheticLease.equals(result.lease()), "Session identity must be retained");
         assertEquals(1700000000, result.expiresAtEpochSeconds());
-        assertEquals(3, result.getClass().getRecordComponents().length);
+        assertEquals(0, result.userId(), "Legacy envelopes have no user ID");
         assertPost("cracked-login");
     }
 
@@ -62,7 +62,7 @@ class HttpGameAuthClientTest {
         assertEquals(AUTH_UUID, result.uuid());
         assertTrue(syntheticLease.equals(result.lease()), "Session identity must be retained");
         assertEquals(1700000001, result.expiresAtEpochSeconds());
-        assertEquals(3, result.getClass().getRecordComponents().length);
+        assertEquals(0, result.userId(), "Legacy envelopes have no user ID");
         assertPost("session-check");
     }
 
@@ -70,6 +70,40 @@ class HttpGameAuthClientTest {
         return "{\"outcome\":\"" + outcome + "\",\"uuid\":\"" + AUTH_UUID
                 + "\",\"lease\":\"" + syntheticLease + "\",\"expires_at\":" + expiry
                 + ",\"whitelist_version\":" + version + "}";
+    }
+
+    @ParameterizedTest(name = "current authentication user ID {index}")
+    @ValueSource(booleans = {false, true})
+    void retainsPositiveUserIdFromSixFieldEnvelope(boolean session) throws Exception {
+        for (long userId : new long[] {1, 42, Long.MAX_VALUE}) {
+            String legacy = authEnvelope(session ? "continue" : "allow", 1700000000, 7);
+            body = legacy.substring(0, legacy.length() - 1) + ",\"user_id\":" + userId + "}";
+            Object result = await(authCall(session));
+            if (session) {
+                var continued = assertInstanceOf(SessionCheckResult.Continued.class, result);
+                assertEquals(AUTH_UUID, continued.uuid());
+                assertEquals(syntheticLease, continued.lease());
+                assertEquals(1700000000, continued.expiresAtEpochSeconds());
+                assertEquals(userId, continued.userId());
+            } else {
+                var allowed = assertInstanceOf(CrackedLoginResult.Allowed.class, result);
+                assertEquals(AUTH_UUID, allowed.uuid());
+                assertEquals(syntheticLease, allowed.lease());
+                assertEquals(1700000000, allowed.expiresAtEpochSeconds());
+                assertEquals(userId, allowed.userId());
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "invalid authentication user ID {index}")
+    @ValueSource(booleans = {false, true})
+    void rejectsMalformedUserIdWithoutFallingBackToLegacy(boolean session) throws Exception {
+        String legacy = authEnvelope(session ? "continue" : "allow", 1700000000, 7);
+        for (String userId : List.of("null", "true", "[]", "{}", "0", "-1", "1.0", "42.5",
+                "9223372036854775808", "-9223372036854775809", "\"7\"")) {
+            body = legacy.substring(0, legacy.length() - 1) + ",\"user_id\":" + userId + "}";
+            assertAuthUnavailable(await(authCall(session)), session);
+        }
     }
 
     private static boolean allCleared(char[] value) {
@@ -87,9 +121,10 @@ class HttpGameAuthClientTest {
     }
 
     @ParameterizedTest(name = "invalid authentication envelopes {index}")
-    @ValueSource(booleans = {false, true})
-    void rejectsEveryMalformedAuthenticationEnvelope(boolean session) throws Exception {
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void rejectsEveryMalformedAuthenticationEnvelope(boolean session, boolean current) throws Exception {
         String valid = authEnvelope(session ? "continue" : "allow", 1700000000, 7);
+        if (current) valid = valid.substring(0, valid.length() - 1) + ",\"user_id\":42}";
         var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
         List<String> invalid = new ArrayList<>(List.of("", "{", "null", "[]", "42", "\"text\"", "{}",
                 valid + " {}", valid.replaceFirst("\\{", "{\"outcome\":\"deny\","),
