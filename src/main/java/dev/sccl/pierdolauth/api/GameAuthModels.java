@@ -9,7 +9,10 @@ public final class GameAuthModels {
     public enum PolicyResult { DENIED, CRACKED, LICENSED, UNAVAILABLE }
 
     public sealed interface CrackedLoginResult {
-        record Allowed(UUID uuid, String lease, long expiresAtEpochSeconds) implements CrackedLoginResult {
+        record Allowed(UUID uuid, String lease, long expiresAtEpochSeconds, long userId) implements CrackedLoginResult {
+            public Allowed(UUID uuid, String lease, long expiresAtEpochSeconds) {
+                this(uuid, lease, expiresAtEpochSeconds, 0);
+            }
             @Override public String toString() { return "Allowed[redacted]"; }
         }
         record Denied() implements CrackedLoginResult {}
@@ -17,7 +20,10 @@ public final class GameAuthModels {
     }
 
     public sealed interface SessionCheckResult {
-        record Continued(UUID uuid, String lease, long expiresAtEpochSeconds) implements SessionCheckResult {
+        record Continued(UUID uuid, String lease, long expiresAtEpochSeconds, long userId) implements SessionCheckResult {
+            public Continued(UUID uuid, String lease, long expiresAtEpochSeconds) {
+                this(uuid, lease, expiresAtEpochSeconds, 0);
+            }
             @Override public String toString() { return "Continued[redacted]"; }
         }
         record Disconnected() implements SessionCheckResult {}

@@ -2,6 +2,7 @@ package dev.sccl.pierdolauth;
 
 import com.github.games647.fastlogin.bukkit.FastLoginBukkit;
 import dev.sccl.pierdolauth.api.HttpGameAuthClient;
+import dev.sccl.pierdolauth.api.AuthenticatedPlayerService;
 import dev.sccl.pierdolauth.admission.AdmissionActions;
 import dev.sccl.pierdolauth.admission.AdmissionService;
 import dev.sccl.pierdolauth.admission.PaperAdmissionListener;
@@ -24,6 +25,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 public final class PierdolAuthPlugin extends JavaPlugin {
     private PluginLifecycle lifecycle;
     private PaperAdmissionListener admissionListener;
+    private HttpGameAuthClient creditClient;
 
     /** Enable-scoped publication callback, invoked only by successful open synchronizer completion. */
     public static java.util.function.Consumer<dev.sccl.pierdolauth.api.GameAuthModels.WhitelistResult.Snapshot>
@@ -73,7 +75,10 @@ public final class PierdolAuthPlugin extends JavaPlugin {
         lifecycle = new PluginLifecycle(() -> {
                     saveDefaultConfig();
                     return new ConfigLoader().load(getDataFolder().toPath().resolve("config.yml"));
-                }, config -> new HttpGameAuthClient(config.apiBaseUrl(), config.credentialFile()),
+                }, config -> {
+                    creditClient = new HttpGameAuthClient(config.apiBaseUrl(), config.credentialFile());
+                    return creditClient;
+                },
                 (client, config, registry) -> {
                     return new WhitelistSynchronizer(client,
                             new ServerPaperWhitelist(getServer()), config.whitelistSyncInterval(),
@@ -140,7 +145,21 @@ public final class PierdolAuthPlugin extends JavaPlugin {
                         guard.close();
                     }
                 });
-        if (lifecycle.enable()) getLogger().info("PierdolAuth enabled");
+        if (lifecycle.enable()) {
+            Bukkit.getServicesManager().register(AuthenticatedPlayerService.class, new AuthenticatedPlayerService() {
+                public java.util.OptionalLong authenticatedUserId(Player player) {
+                    var listener = admissionListener;
+                    return listener == null ? java.util.OptionalLong.empty() : listener.authenticatedUserId(player);
+                }
+                public java.util.concurrent.CompletionStage<Boolean> creditActiveMinutes(java.util.Collection<Long> userIds) {
+                    var client = creditClient;
+                    return client == null ? java.util.concurrent.CompletableFuture.completedFuture(false)
+                            : client.creditActiveMinutes(userIds);
+                }
+                public int maxCreditBatchSize() { return 100; }
+            }, this, org.bukkit.plugin.ServicePriority.Normal);
+            getLogger().info("PierdolAuth enabled");
+        }
     }
 
     private WhitelistSynchronizer.Projection fastLoginProjection(FastLoginIntegration integration) {
@@ -190,6 +209,8 @@ public final class PierdolAuthPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        Bukkit.getServicesManager().unregisterAll(this);
+        creditClient = null;
         if (lifecycle != null) lifecycle.close();
         lifecycle = null;
         admissionListener = null;

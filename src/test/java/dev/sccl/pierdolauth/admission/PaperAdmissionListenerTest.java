@@ -153,6 +153,7 @@ class PaperAdmissionListenerTest {
     private final Client client = new Client();
     private int prompts;
     private int releases;
+    private final List<net.kyori.adventure.text.Component> skinMessages = new ArrayList<>();
     private Runnable onKick = () -> {};
     private boolean bridgeReady = true;
     private final Queue<Runnable> proofs = new ConcurrentLinkedQueue<>();
@@ -170,6 +171,70 @@ class PaperAdmissionListenerTest {
         assertTrue("correct horse".equals(PaperAdmissionListener.parsePassword("/login correct horse").orElseThrow()));
         assertTrue(PaperAdmissionListener.parsePassword("/login").isEmpty());
         assertTrue(PaperAdmissionListener.parsePassword("/Login correct horse").isEmpty());
+    }
+
+    @Test void skinGateBlocksAllLabelsUntilCrackedAdmissionAndAfterKick() {
+        Player exact = join();
+        var labels = List.of("/skin set Player", "/SKINS", "/sR applyskin Player",
+                "/SkinsRestorer", "/skinsrestorer:skin url https://example.invalid/skin.png",
+                "/SkinsRestorer:SR", "/skinsrestorer:skins", "/skinsrestorer:skinsrestorer");
+        for (String label : labels) {
+            var event = command(exact, label);
+            listener.onSkinCommand(event);
+            assertTrue(event.isCancelled(), label);
+            assertEquals(label, event.getMessage());
+        }
+        assertEquals(labels.size(), skinMessages.size());
+        assertTrue(skinMessages.stream().allMatch(message ->
+                ((net.kyori.adventure.text.TextComponent) message).content().contains("log in")));
+        listener.onCommand(command(exact, "/login ignored"));
+        client.pending.complete(new CrackedLoginResult.Allowed(id, "lease", Instant.now().plusSeconds(60).getEpochSecond()));
+        var queued = command(exact, "/skin"); listener.onSkinCommand(queued);
+        assertTrue(queued.isCancelled());
+        callbacks.remove().run();
+        for (String label : labels) {
+            var event = command(exact, label); listener.onSkinCommand(event);
+            assertFalse(event.isCancelled(), label);
+            event.setCancelled(true); listener.onSkinCommand(event);
+            assertTrue(event.isCancelled());
+        }
+        var missing = command(player(), "/skin"); listener.onSkinCommand(missing);
+        assertTrue(missing.isCancelled(), "Equal distinct Player cannot borrow authentication");
+        listener.kick(exact, "Denied");
+        var kicked = command(exact, "/sr"); listener.onSkinCommand(kicked);
+        assertTrue(kicked.isCancelled());
+    }
+
+    @Test void skinGateLeavesUnrelatedCommandsAloneAndFailsClosedWithoutState() {
+        Player exact = player();
+        for (String label : List.of("/login ignored", "/help", "/premium", "/skinny", "/say /skin", "/help https://example.invalid/skin")) {
+            var event = command(exact, label); listener.onSkinCommand(event);
+            assertFalse(event.isCancelled(), label);
+        }
+        assertTrue(skinMessages.isEmpty());
+        var missing = command(exact, "/sr"); listener.onSkinCommand(missing);
+        assertTrue(missing.isCancelled());
+        listener.close();
+        var closed = command(exact, "/skins"); listener.onSkinCommand(closed);
+        assertTrue(closed.isCancelled());
+    }
+
+    @Test void skinGateWaitsForLicensedProofToBeReleased() {
+        registry.publish(List.of(new WhitelistIdentity("Player", ClientType.LICENSED, id)));
+        try (var licensed = licensedService();
+                var adapter = new PaperAdmissionListener(licensed, registry, () -> bridgeReady, proofs::add, () -> permissionOwner)) {
+            Player exact = player();
+            adapter.onJoin(new PlayerJoinEvent(exact, (net.kyori.adventure.text.Component) null));
+            assertTrue(adapter.premiumVerified(exact, () -> true));
+            var before = command(exact, "/skin"); adapter.onSkinCommand(before);
+            assertTrue(before.isCancelled());
+            proofs.remove().run();
+            var after = command(exact, "/skin"); adapter.onSkinCommand(after);
+            assertFalse(after.isCancelled());
+            adapter.onQuit(new PlayerQuitEvent(exact, (net.kyori.adventure.text.Component) null));
+            var quit = command(exact, "/skin"); adapter.onSkinCommand(quit);
+            assertTrue(quit.isCancelled());
+        }
     }
 
     @Test void commandIsRedactedAndCancelledBeforeApiInvocation() {
@@ -825,6 +890,7 @@ class PaperAdmissionListenerTest {
                     case "hashCode" -> 1;
                     case "toString" -> "Player double";
                     case "kick" -> { onKick.run(); yield null; }
+                    case "sendMessage" -> { skinMessages.add((net.kyori.adventure.text.Component) args[0]); yield null; }
                     default -> throw new AssertionError("Unexpected Player operation");
                 });
         permissions[0] = new PermissibleBase(player);

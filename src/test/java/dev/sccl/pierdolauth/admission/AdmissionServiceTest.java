@@ -55,6 +55,26 @@ class AdmissionServiceTest {
     }
 
     private boolean ready = true;
+    @Test void authenticatedRequiresCurrentReleasedTokenAndFailsClosedAfterLifecycle() throws Exception {
+        assertFalse(service.authenticated(null));
+        joinFrozen();
+        var old = tokens.get(id);
+        assertFalse(service.authenticated(old));
+        service.command(old, input());
+        client.logins.getLast().complete(allowed(id, 1_300));
+        assertFalse(service.authenticated(old), "Queued success is not admission");
+        drain();
+        assertTrue(service.authenticated(old));
+        service.discard(old);
+        assertFalse(service.authenticated(old));
+        authenticate();
+        var current = tokens.get(id);
+        assertFalse(service.authenticated(old));
+        assertTrue(service.authenticated(current));
+        service.close();
+        assertFalse(service.authenticated(current));
+    }
+
     private AdmissionService licensedService() {
         return new AdmissionService(client, registry, Duration.ofSeconds(60), clock, scheduler,
                 main::add, actions, 2, () -> ready);
@@ -65,7 +85,9 @@ class AdmissionServiceTest {
         try (var licensed = licensedService()) {
             var token = licensed.join(connection());
             scheduler.fire(Duration.ofSeconds(10));
+            assertFalse(licensed.authenticated(token));
             assertTrue(licensed.premiumVerified(token, id, "pLaYeR"));
+            assertTrue(licensed.authenticated(token));
             assertFalse(licensed.frozen(token));
             assertFalse(licensed.premiumVerified(token, id, "Player"));
             drain();
@@ -73,6 +95,7 @@ class AdmissionServiceTest {
             assertTrue(actions.kicked.isEmpty());
             assertEquals(0, scheduler.live(Duration.ofSeconds(60)));
             licensed.quit(token);
+            assertFalse(licensed.authenticated(token));
             publish(ClientType.CRACKED);
             var cracked = licensed.join(connection());
             assertTrue(licensed.frozen(cracked));

@@ -1,9 +1,11 @@
 package dev.sccl.pierdolauth.admission;
 
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Map;
 import java.util.IdentityHashMap;
 import java.util.Collections;
+import java.util.Locale;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -137,7 +139,29 @@ public final class PaperAdmissionListener implements Listener, AutoCloseable {
         if (closed || token == null || admission.frozen(token)) event.setCancelled(true);
     }
 
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = false)
+    public void onSkinCommand(PlayerCommandPreprocessEvent event) {
+        String message = event.getMessage();
+        if (!message.startsWith("/")) return;
+        // read only the first label
+        int end = 1;
+        while (end < message.length() && !Character.isWhitespace(message.charAt(end))) end++;
+        String label = message.substring(1, end).toLowerCase(Locale.ROOT);
+        label = label.substring(label.lastIndexOf(':') + 1);
+        if (!label.equals("skin") && !label.equals("skins")
+                && !label.equals("sr") && !label.equals("skinsrestorer")) return;
+        if (closed || !admission.authenticated(tokens.get(event.getPlayer()))) {
+            event.setCancelled(true);
+            event.getPlayer().sendMessage(net.kyori.adventure.text.Component.text("Please log in first to use skin commands."));
+        }
+    }
+
     private void gate(Player player, Cancellable event) { cancelIfFrozen(tokens.get(player), event); }
+
+    public OptionalLong authenticatedUserId(Player player) {
+        return closed || player == null || !player.isOnline() ? OptionalLong.empty()
+                : admission.authenticatedUserId(tokens.get(player));
+    }
     private void gateEntity(org.bukkit.entity.Entity entity, Cancellable event) {
         if (entity instanceof Player player) gate(player, event);
     }

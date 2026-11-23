@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.function.Consumer;
@@ -60,6 +61,7 @@ public final class AdmissionService implements AutoCloseable {
         State state = State.FROZEN;
         String lease;
         long expiry;
+        long userId;
         Cancellation timer;
         Resume candidate;
         Entry(ConnectionIdentity connection, long generation, ClientType originalType) {
@@ -150,6 +152,19 @@ public final class AdmissionService implements AutoCloseable {
         return entry != null && entry.token == token && entry.state != State.AUTHENTICATED;
     }
 
+    /** Positive authority for this exact live connection; missing/stale state is never admission. */
+    public synchronized boolean authenticated(ConnectionToken token) {
+        if (closed || token == null) return false;
+        Entry entry = active.get(token.uuid);
+        return entry != null && entry.token == token && entry.state == State.AUTHENTICATED;
+    }
+
+    public synchronized OptionalLong authenticatedUserId(ConnectionToken token) {
+        if (!authenticated(token)) return OptionalLong.empty();
+        long userId = active.get(token.uuid).userId;
+        return userId > 0 ? OptionalLong.of(userId) : OptionalLong.empty();
+    }
+
     private synchronized void licensedExpired(ConnectionToken token) {
         Entry entry = active.get(token.uuid);
         if (closed || entry == null || entry.token != token || entry.state != State.LICENSED_PENDING) return;
@@ -172,6 +187,21 @@ public final class AdmissionService implements AutoCloseable {
         if (entry.timer != null) entry.timer.cancel();
         entry.timer = null;
         actions.release(uuid);
+        // Keep FastLogin admission unchanged; only backend-confirmed identity earns playtime.
+        try {
+            client.premiumVerified(nickname, uuid).whenComplete((result, failure) -> dispatch(() -> {
+                synchronized (AdmissionService.this) {
+                    if (active.get(uuid) != entry || entry.state != State.AUTHENTICATED) return;
+                    if (failure == null && result instanceof CrackedLoginResult.Allowed allowed
+                            && uuid.equals(allowed.uuid()) && allowed.userId() > 0
+                            && allowed.expiresAtEpochSeconds() > clock.instant().getEpochSecond()) {
+                        entry.userId = allowed.userId();
+                    }
+                }
+            }));
+        } catch (RuntimeException ignored) {
+            // No retry and no admission change on backend failure.
+        }
         return true;
     }
 
@@ -238,6 +268,7 @@ public final class AdmissionService implements AutoCloseable {
                 && uuid.equals(allowed.uuid()) && allowed.lease() != null && !allowed.lease().isBlank()
                 && allowed.expiresAtEpochSeconds() > clock.instant().getEpochSecond()) {
             entry.lease = allowed.lease();
+            entry.userId = allowed.userId();
             entry.expiry = allowed.expiresAtEpochSeconds();
             entry.state = State.AUTHENTICATED;
             actions.release(uuid);
@@ -277,6 +308,7 @@ public final class AdmissionService implements AutoCloseable {
         if (valid(uuid, result)) {
             SessionCheckResult.Continued continued = (SessionCheckResult.Continued) result;
             entry.lease = continued.lease();
+            entry.userId = continued.userId();
             entry.expiry = continued.expiresAtEpochSeconds();
         }
         scheduleHeartbeat(uuid, entry);
@@ -350,6 +382,7 @@ public final class AdmissionService implements AutoCloseable {
                         SessionCheckResult.Continued continued = (SessionCheckResult.Continued) result;
                         entry.candidate = null;
                         entry.lease = continued.lease();
+                        entry.userId = continued.userId();
                         entry.expiry = continued.expiresAtEpochSeconds();
                         entry.state = State.AUTHENTICATED;
                         actions.release(uuid);

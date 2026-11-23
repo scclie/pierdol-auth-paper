@@ -3,6 +3,9 @@ package dev.sccl.pierdolauth.api;
 import static dev.sccl.pierdolauth.api.GameAuthModels.*;
 
 import java.util.OptionalLong;
+import java.util.Collection;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 public interface GameAuthClient extends AutoCloseable {
@@ -11,5 +14,9 @@ public interface GameAuthClient extends AutoCloseable {
     // ownership of the mutable input transfers to the client at method invocation, even if it throws synchronously. the caller must never mutate it afterward
     CompletionStage<CrackedLoginResult> crackedLogin(String nickname, char[] password);
     CompletionStage<SessionCheckResult> checkSession(String lease);
+    CompletionStage<CrackedLoginResult> premiumVerified(String nickname, UUID mojangUuid);
+    default CompletionStage<Boolean> creditActiveMinutes(Collection<Long> userIds) {
+        return CompletableFuture.completedFuture(false);
+    }
     @Override void close();
 }

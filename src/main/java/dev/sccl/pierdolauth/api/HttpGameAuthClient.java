@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -113,18 +114,50 @@ public final class HttpGameAuthClient implements GameAuthClient {
         }
     }
 
+    @Override
+    public CompletionStage<CrackedLoginResult> premiumVerified(String nickname, UUID mojangUuid) {
+        var unavailable = new CrackedLoginResult.Unavailable();
+        if (!validNickname(nickname) || mojangUuid == null) return CompletableFuture.completedFuture(unavailable);
+        try {
+            byte[] bytes = json.writeValueAsBytes(java.util.Map.of(
+                    "nickname", nickname, "mojang_uuid", mojangUuid.toString()));
+            return request("POST", "/premium-verified", bytes, this::parseCrackedLogin, unavailable);
+        } catch (Exception ignored) {
+            return CompletableFuture.completedFuture(unavailable);
+        }
+    }
+
+    @Override
+    public CompletionStage<Boolean> creditActiveMinutes(Collection<Long> userIds) {
+        if (userIds == null || userIds.isEmpty() || userIds.size() > 100) {
+            return CompletableFuture.completedFuture(false);
+        }
+        Set<Long> seen = new HashSet<>();
+        StringBuilder body = new StringBuilder("{\"user_ids\":[");
+        for (Long id : userIds) {
+            if (id == null || id <= 0 || !seen.add(id) || seen.size() > 100) {
+                return CompletableFuture.completedFuture(false);
+            }
+            if (seen.size() > 1) body.append(',');
+            body.append(id);
+        }
+        if (seen.isEmpty()) return CompletableFuture.completedFuture(false);
+        byte[] bytes = body.append("]}").toString().getBytes(StandardCharsets.UTF_8);
+        return request("POST", "/active-minutes", bytes, ignored -> true, false, 204);
+    }
+
     private CrackedLoginResult parseCrackedLogin(JsonNode value) {
         if (negativeEnvelope(value, "deny")) return new CrackedLoginResult.Denied();
         if (!positiveEnvelope(value, "allow")) return new CrackedLoginResult.Unavailable();
         return new CrackedLoginResult.Allowed(UUID.fromString(value.get("uuid").textValue()),
-                value.get("lease").textValue(), value.get("expires_at").longValue());
+                value.get("lease").textValue(), value.get("expires_at").longValue(), value.get("user_id").longValue());
     }
 
     private SessionCheckResult parseSessionCheck(JsonNode value) {
         if (negativeEnvelope(value, "disconnect")) return new SessionCheckResult.Disconnected();
         if (!positiveEnvelope(value, "continue")) return new SessionCheckResult.Unavailable();
         return new SessionCheckResult.Continued(UUID.fromString(value.get("uuid").textValue()),
-                value.get("lease").textValue(), value.get("expires_at").longValue());
+                value.get("lease").textValue(), value.get("expires_at").longValue(), value.get("user_id").longValue());
     }
 
     private static boolean negativeEnvelope(JsonNode value, String outcome) {
@@ -134,10 +167,11 @@ public final class HttpGameAuthClient implements GameAuthClient {
     }
 
     private static boolean positiveEnvelope(JsonNode value, String outcome) {
-        if (value == null || !value.isObject() || value.size() != 5
+        if (value == null || !value.isObject() || value.size() != 6
                 || !outcome.equals(value.path("outcome").textValue())
                 || !nonnegativeLong(value.path("whitelist_version"))
                 || !nonnegativeLong(value.path("expires_at"))
+                || !nonnegativeLong(value.path("user_id")) || value.path("user_id").longValue() == 0
                 || !validLease(value.path("lease").textValue())
                 || !value.path("uuid").isTextual()) return false;
         String text = value.get("uuid").textValue();
@@ -215,6 +249,11 @@ public final class HttpGameAuthClient implements GameAuthClient {
 
     private synchronized <T> CompletionStage<T> request(String method, String path, byte[] bytes,
             Function<JsonNode, T> parser, T unavailable) {
+        return request(method, path, bytes, parser, unavailable, 200);
+    }
+
+    private synchronized <T> CompletionStage<T> request(String method, String path, byte[] bytes,
+            Function<JsonNode, T> parser, T unavailable, int successStatus) {
         if (closed) {
             if (bytes != null) Arrays.fill(bytes, (byte) 0);
             return CompletableFuture.completedFuture(unavailable);
@@ -245,8 +284,8 @@ public final class HttpGameAuthClient implements GameAuthClient {
             executor.execute(() -> {
                 try {
                     HttpResponse<byte[]> response = http.send(request, new BoundedResponseBodyHandler());
-                    complete.accept(response.statusCode() == 200
-                            ? parser.apply(json.readTree(response.body())) : unavailable);
+                    complete.accept(response.statusCode() == successStatus
+                            ? parser.apply(successStatus == 204 ? null : json.readTree(response.body())) : unavailable);
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     complete.accept(unavailable);

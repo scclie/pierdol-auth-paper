@@ -14,5 +14,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
+      - name: Fetch verified FastLogin compile-only JAR
+        run: |
+          python3 scripts/fetch-fastlogin-jar.py \
+            --url 'https://api.spiget.org/v2/resources/134322/download?version=636152' \
+            --sri-sha256 'sha256-sxVoz7e4gVCQ2ewDT5z315oue5HPZlAFy7/G7XCEDOs=' \
+            --output "${RUNNER_TEMP}/FastLogin.jar"
       - name: Build and test plugin
+        env:
+          FASTLOGIN_JAR: ${{ runner.temp }}/FastLogin.jar
         run: ./gradlew --no-daemon clean check
